@@ -37,6 +37,8 @@ target_link_libraries(transmissor-ndi PRIVATE
   shell32
   dwmapi
   uxtheme
+  iphlpapi
+  ws2_32
 )
 
 if(MSVC)
