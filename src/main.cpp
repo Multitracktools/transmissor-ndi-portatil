@@ -203,7 +203,92 @@ void drawCursorInto(HDC target, const RECT& monitorBounds) {
 
 using NdiLoadFunction = const NDIlib_v6* (*)();
 
-void transmit(CaptureTarget target, std::string sourceName, bool showCursor) {
+void transmitMonitor(MonitorInfo monitor, std::string sourceName, bool showCursor) {
+    const auto dllPath = executableDirectory() / L"Processing.NDI.Lib.x64.dll";
+    HMODULE ndiModule = LoadLibraryW(dllPath.c_str());
+    if (!ndiModule) {
+        postStatus(L"Erro: biblioteca NDI ausente ou bloqueada. Consulte o log.");
+        g_app.running = false;
+        return;
+    }
+
+    auto loadNdi = reinterpret_cast<NdiLoadFunction>(GetProcAddress(ndiModule, "NDIlib_v6_load"));
+    const NDIlib_v6* ndi = loadNdi ? loadNdi() : nullptr;
+    if (!ndi || !ndi->initialize()) {
+        postStatus(L"Erro: não foi possível inicializar o NDI.");
+        FreeLibrary(ndiModule);
+        g_app.running = false;
+        return;
+    }
+
+    NDIlib_send_create_t create{};
+    create.p_ndi_name = sourceName.c_str();
+    create.clock_video = true;
+    create.clock_audio = false;
+    NDIlib_send_instance_t sender = ndi->send_create(&create);
+    if (!sender) {
+        postStatus(L"Erro: o NDI não conseguiu criar a transmissão.");
+        ndi->destroy();
+        FreeLibrary(ndiModule);
+        g_app.running = false;
+        return;
+    }
+
+    const int width = monitor.bounds.right - monitor.bounds.left;
+    const int height = monitor.bounds.bottom - monitor.bounds.top;
+    HDC screenDc = GetDC(nullptr);
+    HDC memoryDc = CreateCompatibleDC(screenDc);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    HGDIOBJ previous = bitmap ? SelectObject(memoryDc, bitmap) : nullptr;
+
+    if (!screenDc || !memoryDc || !bitmap || !pixels) {
+        postStatus(L"Erro: não foi possível preparar a captura da tela.");
+    } else {
+        NDIlib_video_frame_v2_t frame{};
+        frame.xres = width;
+        frame.yres = height;
+        frame.FourCC = NDIlib_FourCC_video_type_BGRX;
+        frame.frame_rate_N = 30000;
+        frame.frame_rate_D = 1000;
+        frame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+        frame.frame_format_type = NDIlib_frame_format_type_progressive;
+        frame.timecode = NDIlib_send_timecode_synthesize;
+        frame.p_data = static_cast<uint8_t*>(pixels);
+        frame.line_stride_in_bytes = width * 4;
+
+        postStatus(L"Transmitindo monitor via NDI — 30 FPS");
+        while (!g_app.stopRequested.load()) {
+            if (!BitBlt(memoryDc, 0, 0, width, height, screenDc,
+                        monitor.bounds.left, monitor.bounds.top, SRCCOPY | CAPTUREBLT)) {
+                postStatus(L"Erro durante a captura da tela.");
+                break;
+            }
+            if (showCursor) drawCursorInto(memoryDc, monitor.bounds);
+            ndi->send_send_video_v2(sender, &frame);
+        }
+    }
+
+    if (previous) SelectObject(memoryDc, previous);
+    if (bitmap) DeleteObject(bitmap);
+    if (memoryDc) DeleteDC(memoryDc);
+    if (screenDc) ReleaseDC(nullptr, screenDc);
+    ndi->send_destroy(sender);
+    ndi->destroy();
+    FreeLibrary(ndiModule);
+    g_app.running = false;
+    postStatus(L"Transmissão encerrada.");
+}
+
+void transmitWindow(CaptureTarget target, std::string sourceName, bool showCursor) {
     const auto dllPath = executableDirectory() / L"Processing.NDI.Lib.x64.dll";
     HMODULE ndiModule = LoadLibraryW(dllPath.c_str());
     if (!ndiModule) {
@@ -245,26 +330,44 @@ void transmit(CaptureTarget target, std::string sourceName, bool showCursor) {
         }
     }
 
-    const int width = target.bounds.right - target.bounds.left;
-    const int height = target.bounds.bottom - target.bounds.top;
     HDC screenDc = GetDC(nullptr);
     HDC memoryDc = CreateCompatibleDC(screenDc);
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmapInfo.bmiHeader.biWidth = width;
-    bitmapInfo.bmiHeader.biHeight = -height;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ originalBitmap = nullptr;
     void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    HGDIOBJ previous = bitmap ? SelectObject(memoryDc, bitmap) : nullptr;
+    int width = 0;
+    int height = 0;
+    NDIlib_video_frame_v2_t frame{};
 
-    if (!screenDc || !memoryDc || !bitmap || !pixels) {
-        postStatus(L"Erro: não foi possível preparar a captura da tela.");
-    } else {
-        NDIlib_video_frame_v2_t frame{};
+    const auto resizeCaptureSurface = [&](const RECT& bounds) -> bool {
+        const int newWidth = bounds.right - bounds.left;
+        const int newHeight = bounds.bottom - bounds.top;
+        if (newWidth <= 0 || newHeight <= 0) return false;
+        if (bitmap && newWidth == width && newHeight == height) return true;
+
+        if (bitmap) {
+            SelectObject(memoryDc, originalBitmap);
+            DeleteObject(bitmap);
+            bitmap = nullptr;
+            pixels = nullptr;
+        }
+
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = newWidth;
+        bitmapInfo.bmiHeader.biHeight = -newHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+        bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!bitmap || !pixels) return false;
+        HGDIOBJ replaced = SelectObject(memoryDc, bitmap);
+        if (!originalBitmap) originalBitmap = replaced;
+
+        width = newWidth;
+        height = newHeight;
+        frame = {};
         frame.xres = width;
         frame.yres = height;
         frame.FourCC = NDIlib_FourCC_video_type_BGRX;
@@ -275,36 +378,36 @@ void transmit(CaptureTarget target, std::string sourceName, bool showCursor) {
         frame.timecode = NDIlib_send_timecode_synthesize;
         frame.p_data = static_cast<uint8_t*>(pixels);
         frame.line_stride_in_bytes = width * 4;
+        return true;
+    };
 
-        postStatus(target.kind == CaptureKind::Window
-            ? L"Transmitindo janela via NDI — 30 FPS"
-            : L"Transmitindo monitor via NDI — 30 FPS");
+    if (!screenDc || !memoryDc || !resizeCaptureSurface(target.bounds)) {
+        postStatus(L"Erro: não foi possível preparar a captura da tela.");
+    } else {
+        postStatus(L"Transmitindo janela via NDI — 30 FPS");
         while (!g_app.stopRequested.load()) {
             RECT currentBounds = target.bounds;
-            if (target.kind == CaptureKind::Window) {
-                if (!IsWindow(target.window) || IsIconic(target.window)) {
-                    postStatus(L"A janela foi fechada ou minimizada. Transmissão encerrada.");
-                    break;
-                }
-                GetWindowRect(target.window, &currentBounds);
-                const int currentWidth = currentBounds.right - currentBounds.left;
-                const int currentHeight = currentBounds.bottom - currentBounds.top;
-                if (currentWidth != width || currentHeight != height) {
-                    postStatus(L"A janela mudou de tamanho. Clique em Iniciar para reconectar.");
-                    break;
-                }
+            if (!IsWindow(target.window)) {
+                postStatus(L"A janela selecionada foi fechada. Transmissão encerrada por segurança.");
+                break;
+            }
+            if (IsIconic(target.window)) {
+                postStatus(L"A janela foi minimizada. Restaure-a para continuar transmitindo.");
+                break;
+            }
+            if (!GetWindowRect(target.window, &currentBounds)) {
+                postStatus(L"Não foi possível acompanhar a janela selecionada.");
+                break;
+            }
+            if (!resizeCaptureSurface(currentBounds)) {
+                postStatus(L"Não foi possível ajustar a captura ao novo tamanho da janela.");
+                break;
             }
 
-            bool captured = false;
-            if (target.kind == CaptureKind::Window) {
-                captured = PrintWindow(target.window, memoryDc, 0x00000002) != FALSE;
-                if (!captured) {
-                    captured = BitBlt(memoryDc, 0, 0, width, height, screenDc,
-                                      currentBounds.left, currentBounds.top, SRCCOPY | CAPTUREBLT) != FALSE;
-                }
-            } else {
+            bool captured = PrintWindow(target.window, memoryDc, 0x00000002) != FALSE;
+            if (!captured) {
                 captured = BitBlt(memoryDc, 0, 0, width, height, screenDc,
-                                  target.bounds.left, target.bounds.top, SRCCOPY | CAPTUREBLT) != FALSE;
+                                  currentBounds.left, currentBounds.top, SRCCOPY | CAPTUREBLT) != FALSE;
             }
 
             if (!captured) {
@@ -316,7 +419,7 @@ void transmit(CaptureTarget target, std::string sourceName, bool showCursor) {
         }
     }
 
-    if (previous) SelectObject(memoryDc, previous);
+    if (originalBitmap) SelectObject(memoryDc, originalBitmap);
     if (bitmap) DeleteObject(bitmap);
     if (memoryDc) DeleteDC(memoryDc);
     if (screenDc) ReleaseDC(nullptr, screenDc);
@@ -388,7 +491,12 @@ void startTransmission() {
 
     std::scoped_lock lock(g_app.workerMutex);
     if (g_app.worker.joinable()) g_app.worker.join();
-    g_app.worker = std::thread(transmit, target, utf8(wideName), showCursor);
+    if (kind == CaptureKind::Monitor) {
+        g_app.worker = std::thread(transmitMonitor, g_app.monitors[sourceIndex],
+                                   utf8(wideName), showCursor);
+    } else {
+        g_app.worker = std::thread(transmitWindow, target, utf8(wideName), showCursor);
+    }
 }
 
 HFONT createUiFont() {
