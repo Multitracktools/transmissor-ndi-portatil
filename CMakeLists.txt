@@ -10,6 +10,7 @@ add_executable(transmissor-ndi WIN32
   src/capture.cpp
   src/ndi_sender.cpp
   src/ip_filter.cpp
+  src/protected_ip_ui.cpp
   src/settings.cpp
   src/resources.rc
 )
