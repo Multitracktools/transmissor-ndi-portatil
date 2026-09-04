@@ -86,6 +86,14 @@ std::wstring getText(HWND hwnd) {
     return text;
 }
 
+bool isChecked(HWND hwnd) {
+    return SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void setChecked(HWND hwnd, bool checked) {
+    SendMessageW(hwnd, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 void postStatus(const std::wstring& text) {
     auto* copy = new std::wstring(text);
     if (!PostMessageW(g.window, kStatusMessage, 0, reinterpret_cast<LPARAM>(copy))) delete copy;
@@ -137,8 +145,8 @@ void collectSettings() {
     g.settings.captureKind = selectedKind();
     g.settings.sourceIndex = static_cast<int>(SendMessageW(g.captureSource, CB_GETCURSEL, 0, 0));
     g.settings.fps = SendMessageW(g.fps, CB_GETCURSEL, 0, 0) == 1 ? 60 : 30;
-    g.settings.showCursor = Button_GetCheck(g.cursor) == BST_CHECKED;
-    g.settings.mode = Button_GetCheck(g.quickMode) == BST_CHECKED ? TransmissionMode::Quick : TransmissionMode::Protected;
+    g.settings.showCursor = isChecked(g.cursor);
+    g.settings.mode = isChecked(g.quickMode) ? TransmissionMode::Quick : TransmissionMode::Protected;
     saveSettings(iniPath(), g.settings);
 }
 
@@ -284,8 +292,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g.captureKind, CB_SETCURSEL, g.settings.captureKind == CaptureKind::Window ? 1 : 0, 0);
         refreshSources(g.settings.sourceIndex);
         SendMessageW(g.fps, CB_SETCURSEL, g.settings.fps == 60 ? 1 : 0, 0);
-        Button_SetCheck(g.cursor, g.settings.showCursor ? BST_CHECKED : BST_UNCHECKED);
-        Button_SetCheck(g.settings.mode == TransmissionMode::Quick ? g.quickMode : g.protectedMode, BST_CHECKED);
+        setChecked(g.cursor, g.settings.showCursor);
+        setChecked(g.settings.mode == TransmissionMode::Quick ? g.quickMode : g.protectedMode, true);
         updateControls();
         if (g.settings.showHelpOnStart) PostMessageW(hwnd, WM_COMMAND, IdHelp, 0);
         return 0;
@@ -348,7 +356,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
 
     HWND hwnd = CreateWindowExW(0, kWindowClass, L"Transmissor NDI Portátil — V3",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 750, 500, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 480, nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
 
     ShowWindow(hwnd, show);
