@@ -187,9 +187,10 @@ bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int f
 int NdiSender::connections() const {
     auto* api = static_cast<const NDIlib_v6*>(api_);
     if (!api || !sender_) return 0;
-    const int count = api->send_get_no_connections(static_cast<NDIlib_send_instance_t>(sender_), 0);
-    logRemoteEndpoints(count);
-    return count;
+    const int technicalCount = api->send_get_no_connections(static_cast<NDIlib_send_instance_t>(sender_), 0);
+    logRemoteEndpoints(technicalCount);
+    // O modo por IP trata todas as conexões técnicas da máquina permitida como um único receptor lógico.
+    return technicalCount > 0 ? 1 : 0;
 }
 
 bool NdiSender::valid() const { return api_ && sender_; }
