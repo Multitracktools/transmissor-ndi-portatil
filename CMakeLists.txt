@@ -9,6 +9,7 @@ add_executable(transmissor-ndi WIN32
   src/main.cpp
   src/capture.cpp
   src/ndi_sender.cpp
+  src/ip_filter.cpp
   src/settings.cpp
   src/resources.rc
 )
@@ -39,6 +40,7 @@ target_link_libraries(transmissor-ndi PRIVATE
   uxtheme
   iphlpapi
   ws2_32
+  fwpuclnt
 )
 
 if(MSVC)
