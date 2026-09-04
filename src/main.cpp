@@ -3,6 +3,7 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -34,8 +35,6 @@ constexpr COLORREF kPanel2 = RGB(17, 24, 35);
 constexpr COLORREF kBorder = RGB(46, 58, 76);
 constexpr COLORREF kText = RGB(240, 244, 250);
 constexpr COLORREF kMuted = RGB(158, 171, 191);
-constexpr COLORREF kBlue = RGB(70, 130, 255);
-constexpr COLORREF kGreen = RGB(49, 201, 125);
 
 HBRUSH gBgBrush{};
 HBRUSH gPanelBrush{};
@@ -92,9 +91,11 @@ struct UiState {
     std::atomic_bool running{false};
     std::atomic_bool stopRequested{false};
     std::atomic_bool authorized{false};
+    std::atomic_bool additionalConnectionLock{false};
     std::atomic_bool allowWa{false};
     std::atomic_bool allowTg{false};
-    std::atomic_int receiverCount{0};
+    std::atomic_int rawConnections{0};
+    std::atomic_int baselineConnections{0};
     bool activeProtectedMode{true};
 
     std::thread worker;
@@ -146,8 +147,8 @@ void postStatus(const std::wstring& text) {
     if (!PostMessageW(g.window, kStatusMessage, 0, reinterpret_cast<LPARAM>(copy))) delete copy;
 }
 
-void postReceiverCount(int count) {
-    PostMessageW(g.window, kReceiverMessage, static_cast<WPARAM>(count), 0);
+void postConnectionState(int rawCount) {
+    PostMessageW(g.window, kReceiverMessage, static_cast<WPARAM>(rawCount), 0);
 }
 
 void applyDarkTheme(HWND hwnd) {
@@ -179,7 +180,7 @@ void refreshSources(int preferredIndex = -1) {
         const int index = preferredIndex >= 0 && preferredIndex < count ? preferredIndex : 0;
         SendMessageW(g.captureSource, CB_SETCURSEL, index, 0);
     }
-    InvalidateRect(g.preview, nullptr, TRUE);
+    if (g.preview) InvalidateRect(g.preview, nullptr, TRUE);
 }
 
 CaptureSource currentSource() {
@@ -223,8 +224,16 @@ void updateControls() {
     EnableWindow(g.protectedMode, !running);
     EnableWindow(g.quickMode, !running);
 
-    const bool canRelease = running && g.activeProtectedMode && g.receiverCount.load() == 1 && !g.authorized.load();
+    const int raw = g.rawConnections.load();
+    const int baseline = g.baselineConnections.load();
+    const bool extraLock = g.additionalConnectionLock.load();
+    const bool groupIsSafe = raw > 0 && (baseline == 0 || raw <= baseline);
+    const bool canRelease = running && g.activeProtectedMode && !g.authorized.load() && groupIsSafe;
     EnableWindow(g.release, canRelease);
+
+    if (g.release) {
+        SetWindowTextW(g.release, extraLock ? L"Liberar novamente" : L"Liberar transmissão");
+    }
 }
 
 std::vector<unsigned char> createMessageFrame(int width, int height,
@@ -330,8 +339,8 @@ void drawPreview(HDC dc, const RECT& client) {
 
     const int cw = client.right - client.left;
     const int ch = client.bottom - client.top;
-    const double scale = min(static_cast<double>(cw) / g.previewWidth,
-                             static_cast<double>(ch) / g.previewHeight);
+    const double scale = std::min(static_cast<double>(cw) / g.previewWidth,
+                                  static_cast<double>(ch) / g.previewHeight);
     const int dw = static_cast<int>(g.previewWidth * scale);
     const int dh = static_cast<int>(g.previewHeight * scale);
     const int dx = (cw - dw) / 2;
@@ -374,8 +383,8 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
         return;
     }
 
-    const int placeholderWidth = 1280;
-    const int placeholderHeight = 720;
+    constexpr int placeholderWidth = 1280;
+    constexpr int placeholderHeight = 720;
     const auto waitingFrame = createMessageFrame(
         placeholderWidth, placeholderHeight,
         L"Transmissão protegida",
@@ -387,9 +396,11 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
         L"Foi detectada uma conexão adicional.",
         sourceDisplayName);
 
-    g.authorized = (mode == TransmissionMode::Quick);
-    g.receiverCount = 0;
-    postReceiverCount(0);
+    g.authorized = mode == TransmissionMode::Quick;
+    g.additionalConnectionLock = false;
+    g.rawConnections = 0;
+    g.baselineConnections = 0;
+    postConnectionState(0);
     postStatus(mode == TransmissionMode::Protected
         ? L"Fonte NDI ativa — aguardando receptor."
         : L"Modo rápido — transmissão iniciada.");
@@ -398,35 +409,41 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
     int width = 0;
     int height = 0;
     int previousConnections = -1;
-    bool extraConnectionLock = false;
     auto nextFrame = std::chrono::steady_clock::now();
 
     while (!g.stopRequested.load()) {
-        const int connections = sender.connections();
+        const int connections = std::max(0, sender.connections());
         if (connections != previousConnections) {
             previousConnections = connections;
-            g.receiverCount = connections;
-            postReceiverCount(connections);
+            g.rawConnections = connections;
+            postConnectionState(connections);
 
             if (mode == TransmissionMode::Protected) {
-                if (connections > 1) {
-                    extraConnectionLock = true;
+                const int baseline = g.baselineConnections.load();
+
+                if (connections == 0) {
                     g.authorized = false;
-                    postStatus(L"Transmissão bloqueada — foi detectado mais de um receptor.");
-                } else if (connections == 1 && !g.authorized.load()) {
-                    postStatus(extraConnectionLock
-                        ? L"Restou um receptor. Clique em Liberar novamente para continuar."
-                        : L"Receptor conectado — clique em Liberar transmissão quando estiver pronto.");
-                } else if (connections == 0) {
+                    g.additionalConnectionLock = false;
+                    g.baselineConnections = 0;
                     postStatus(L"Fonte NDI ativa — aguardando receptor.");
+                } else if (baseline > 0 && connections > baseline) {
+                    g.authorized = false;
+                    g.additionalConnectionLock = true;
+                    postStatus(L"Transmissão bloqueada — foi detectada uma conexão adicional.");
+                } else if (!g.authorized.load()) {
+                    postStatus(g.additionalConnectionLock.load()
+                        ? L"Conexão original restabelecida. Clique em Liberar novamente."
+                        : L"Receptor detectado — clique em Liberar transmissão quando estiver pronto.");
                 }
-            } else if (connections > 1) {
-                postStatus(L"Modo rápido — aviso: há mais de um receptor conectado.");
+            } else {
+                postStatus(connections > 0
+                    ? L"Modo rápido — receptor detectado."
+                    : L"Modo rápido — aguardando receptor.");
             }
         }
 
         if (mode == TransmissionMode::Protected && !g.authorized.load()) {
-            const auto& protectedFrame = extraConnectionLock ? extraConnectionFrame : waitingFrame;
+            const auto& protectedFrame = g.additionalConnectionLock.load() ? extraConnectionFrame : waitingFrame;
             if (!sender.sendFrame(protectedFrame.data(), placeholderWidth, placeholderHeight, fps)) {
                 postStatus(L"Falha ao enviar tela protegida NDI.");
                 break;
@@ -444,15 +461,18 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
 
         nextFrame += std::chrono::microseconds(1000000 / fps);
         std::this_thread::sleep_until(nextFrame);
-        if (std::chrono::steady_clock::now() - nextFrame > 1s) nextFrame = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - nextFrame > 1s)
+            nextFrame = std::chrono::steady_clock::now();
     }
 
     sender.close();
     g.running = false;
     g.stopRequested = false;
     g.authorized = false;
-    g.receiverCount = 0;
-    postReceiverCount(0);
+    g.additionalConnectionLock = false;
+    g.rawConnections = 0;
+    g.baselineConnections = 0;
+    postConnectionState(0);
     postStatus(L"Transmissão encerrada.");
     PostMessageW(g.window, kWorkerEnded, 0, 0);
 }
@@ -464,6 +484,7 @@ void startTransmission() {
         MessageBoxW(g.window, L"Informe um nome para a fonte NDI.", L"Transmissor NDI", MB_OK | MB_ICONWARNING);
         return;
     }
+
     CaptureSource source = currentSource();
     if (source.bounds.right <= source.bounds.left || source.bounds.bottom <= source.bounds.top) {
         MessageBoxW(g.window, L"Selecione uma fonte de captura válida.", L"Transmissor NDI", MB_OK | MB_ICONWARNING);
@@ -474,9 +495,12 @@ void startTransmission() {
     const int fps = g.settings.fps;
     const bool showCursor = g.settings.showCursor;
     const TransmissionMode mode = g.settings.mode;
+
     g.activeProtectedMode = mode == TransmissionMode::Protected;
     g.authorized = mode == TransmissionMode::Quick;
-    g.receiverCount = 0;
+    g.additionalConnectionLock = false;
+    g.rawConnections = 0;
+    g.baselineConnections = 0;
     g.stopRequested = false;
     g.running = true;
     updateControls();
@@ -488,10 +512,21 @@ void startTransmission() {
 
 void releaseTransmission() {
     if (!g.running.load() || !g.activeProtectedMode) return;
-    if (g.receiverCount.load() != 1) return;
+
+    const int raw = g.rawConnections.load();
+    const int baseline = g.baselineConnections.load();
+    if (raw <= 0) return;
+    if (baseline > 0 && raw > baseline) return;
+
+    if (baseline == 0) {
+        g.baselineConnections = raw;
+    }
+
+    g.additionalConnectionLock = false;
     g.authorized = true;
-    postStatus(L"Conteúdo liberado para o receptor conectado.");
+    postStatus(L"Conteúdo liberado para o receptor detectado.");
     updateControls();
+    InvalidateRect(g.window, nullptr, FALSE);
 }
 
 void stopTransmission() {
@@ -506,18 +541,20 @@ void showHelp() {
     MessageBoxW(g.window,
         L"1. Escolha Monitor ou Janela e confirme a fonte na prévia.\n"
         L"2. No Modo protegido, a fonte NDI começa com uma tela de espera.\n"
-        L"3. Quando exatamente um receptor conectar, clique em Liberar transmissão.\n"
-        L"4. Se entrar outro receptor, a imagem é bloqueada imediatamente.\n"
-        L"5. As permissões de WhatsApp e Telegram valem apenas durante esta execução.\n"
-        L"6. No Modo rápido, a imagem começa imediatamente e conexões extras apenas geram aviso.\n\n"
-        L"Nenhuma transmissão começa automaticamente ao abrir o aplicativo.",
+        L"3. O NDI pode abrir mais de uma conexão técnica para um único receptor.\n"
+        L"4. Ao clicar em Liberar, o aplicativo memoriza esse conjunto como a linha de base.\n"
+        L"5. Se o número de conexões subir acima da linha de base, a imagem é bloqueada.\n"
+        L"6. Depois que voltar à linha de base, clique em Liberar novamente.\n\n"
+        L"WhatsApp e Telegram continuam protegidos por padrão durante cada execução.",
         L"Como usar — V3", MB_OK | MB_ICONINFORMATION);
 }
 
 HWND addControl(const wchar_t* cls, const wchar_t* text, DWORD style,
                 int x, int y, int w, int h, int id, HFONT font = nullptr) {
-    HWND hwnd = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g.window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    HWND hwnd = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+        x, y, w, h, g.window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        GetModuleHandleW(nullptr), nullptr);
     if (font) setControlFont(hwnd, font);
     applyDarkTheme(hwnd);
     return hwnd;
@@ -555,7 +592,6 @@ void drawSmallText(HDC dc, int x, int y, const wchar_t* text, int width = 300) {
 
 void createUi() {
     g.help = addControl(L"BUTTON", L"?  Como usar", BS_PUSHBUTTON, 842, 18, 130, 34, IdHelp, gFont);
-
     g.sourceName = addControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 32, 206, 480, 34, IdSourceName, gFont);
 
     g.captureKind = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, 32, 286, 150, 220, IdCaptureKind, gFont);
@@ -570,30 +606,40 @@ void createUi() {
     SendMessageW(g.fps, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"60 FPS"));
     g.cursor = addControl(L"BUTTON", L"Mostrar cursor", BS_AUTOCHECKBOX, 174, 356, 160, 28, IdCursor, gFont);
 
-    g.protectedMode = addControl(L"BUTTON", L"Modo protegido\r\nConfirma o receptor antes de liberar", BS_AUTORADIOBUTTON | BS_MULTILINE | WS_GROUP,
-                                 32, 420, 230, 72, IdProtected, gFont);
-    g.quickMode = addControl(L"BUTTON", L"Modo rápido\r\nComeça a mostrar imediatamente", BS_AUTORADIOBUTTON | BS_MULTILINE,
-                             274, 420, 238, 72, IdQuick, gFont);
+    g.protectedMode = addControl(L"BUTTON", L"Modo protegido\r\nConfirma o receptor antes de liberar",
+        BS_AUTORADIOBUTTON | BS_MULTILINE | WS_GROUP, 32, 420, 230, 72, IdProtected, gFont);
+    g.quickMode = addControl(L"BUTTON", L"Modo rápido\r\nComeça a mostrar imediatamente",
+        BS_AUTORADIOBUTTON | BS_MULTILINE, 274, 420, 238, 72, IdQuick, gFont);
 
-    g.allowWhatsApp = addControl(L"BUTTON", L"Permitir envio do WhatsApp", BS_AUTOCHECKBOX, 32, 538, 480, 36, IdAllowWhatsApp, gFont);
-    g.allowTelegram = addControl(L"BUTTON", L"Permitir envio do Telegram", BS_AUTOCHECKBOX, 32, 580, 480, 36, IdAllowTelegram, gFont);
+    g.allowWhatsApp = addControl(L"BUTTON", L"Permitir envio do WhatsApp", BS_AUTOCHECKBOX,
+        32, 538, 480, 36, IdAllowWhatsApp, gFont);
+    g.allowTelegram = addControl(L"BUTTON", L"Permitir envio do Telegram", BS_AUTOCHECKBOX,
+        32, 580, 480, 36, IdAllowTelegram, gFont);
 
-    g.release = addControl(L"BUTTON", L"Liberar transmissão", BS_PUSHBUTTON, 572, 332, 368, 40, IdRelease, gFontBold);
-    g.preview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VISIBLE, 572, 460, 368, 186,
-                                g.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdPreview)), GetModuleHandleW(nullptr), nullptr);
+    g.release = addControl(L"BUTTON", L"Liberar transmissão", BS_PUSHBUTTON,
+        572, 332, 368, 40, IdRelease, gFontBold);
+    g.preview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VISIBLE,
+        572, 460, 368, 186, g.window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdPreview)),
+        GetModuleHandleW(nullptr), nullptr);
 
-    g.start = addControl(L"BUTTON", L"Iniciar transmissão", BS_DEFPUSHBUTTON, 770, 680, 170, 42, IdStart, gFontBold);
-    g.stop = addControl(L"BUTTON", L"Parar", BS_PUSHBUTTON, 650, 680, 108, 42, IdStop, gFont);
+    g.start = addControl(L"BUTTON", L"Iniciar transmissão", BS_DEFPUSHBUTTON,
+        770, 680, 170, 42, IdStart, gFontBold);
+    g.stop = addControl(L"BUTTON", L"Parar", BS_PUSHBUTTON,
+        650, 680, 108, 42, IdStop, gFont);
 
-    g.receivers = addControl(L"STATIC", L"0 conectados", SS_LEFT, 274, 98, 190, 26, IdReceivers, gFontBold);
-    g.status = addControl(L"STATIC", L"Pronta para iniciar", SS_LEFT | SS_END_ELLIPSIS, 32, 98, 205, 26, IdStatus, gFontBold);
+    g.receivers = addControl(L"STATIC", L"Nenhum receptor", SS_LEFT,
+        274, 98, 190, 26, IdReceivers, gFontBold);
+    g.status = addControl(L"STATIC", L"Pronta para iniciar", SS_LEFT | SS_ENDELLIPSIS,
+        32, 98, 205, 26, IdStatus, gFontBold);
 }
 
 LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc{}; GetClientRect(hwnd, &rc);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
         drawPreview(dc, rc);
         EndPaint(hwnd, &ps);
         return 0;
@@ -617,8 +663,6 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         setChecked(g.settings.mode == TransmissionMode::Quick ? g.quickMode : g.protectedMode, true);
         setChecked(g.allowWhatsApp, false);
         setChecked(g.allowTelegram, false);
-        g.allowWa = false;
-        g.allowTg = false;
         updateControls();
         SetTimer(hwnd, kPreviewTimer, 200, nullptr);
         if (g.settings.showHelpOnStart) PostMessageW(hwnd, WM_COMMAND, IdHelp, 0);
@@ -660,7 +704,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        RECT client{}; GetClientRect(hwnd, &client);
+        RECT client{};
+        GetClientRect(hwnd, &client);
         FillRect(dc, &client, gBgBrush);
 
         SetBkMode(dc, TRANSPARENT);
@@ -680,8 +725,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         drawSmallText(dc, 748, 84, L"Desempenho", 180);
         SetTextColor(dc, kText);
         SelectObject(dc, gFontBold);
-        RECT envio{510, 103, 690, 130}; DrawTextW(dc, L"— Mbps", -1, &envio, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT perf{748, 103, 930, 130}; DrawTextW(dc, g.running ? L"Em transmissão" : L"Aguardando", -1, &perf, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT envio{510, 103, 690, 130};
+        DrawTextW(dc, L"— Mbps", -1, &envio, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT perf{748, 103, 930, 130};
+        DrawTextW(dc, g.running ? L"Em transmissão" : L"Aguardando", -1, &perf, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         drawPanel(dc, {20, 158, 536, 654});
         drawPanel(dc, {552, 158, 960, 654});
@@ -697,16 +744,18 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, kText);
         SelectObject(dc, gFontTitle);
         RECT number{572, 216, 940, 264};
-        const std::wstring count = std::to_wstring(g.receiverCount.load());
-        DrawTextW(dc, count.c_str(), -1, &number, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* receiverGlyph = g.rawConnections.load() == 0 ? L"0" : L"1";
+        DrawTextW(dc, receiverGlyph, -1, &number, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, gFontSmall);
         SetTextColor(dc, kMuted);
         RECT access{582, 266, 930, 318};
-        const wchar_t* accessText = g.receiverCount.load() == 0
+        const wchar_t* accessText = g.rawConnections.load() == 0
             ? L"Nenhum receptor conectado. A imagem ficará em espera até sua confirmação."
-            : g.receiverCount.load() == 1
-                ? L"Um receptor conectado. Libere quando estiver pronto."
-                : L"Mais de um receptor conectado. A transmissão está protegida.";
+            : g.additionalConnectionLock.load()
+                ? L"Foi detectada uma conexão adicional. A transmissão permanece protegida."
+                : g.authorized.load()
+                    ? L"Receptor autorizado. A transmissão está liberada."
+                    : L"Receptor detectado. Libere quando estiver pronto.";
         DrawTextW(dc, accessText, -1, &access, DT_CENTER | DT_WORDBREAK);
 
         RECT privacy{572, 384, 940, 442};
@@ -715,18 +764,22 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DeleteObject(privacyBrush);
         SetTextColor(dc, RGB(197, 246, 218));
         SelectObject(dc, gFontBold);
-        RECT p1{588, 390, 925, 416}; DrawTextW(dc, L"Modo Privacidade ativo", -1, &p1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT p1{588, 390, 925, 416};
+        DrawTextW(dc, L"Modo Privacidade ativo", -1, &p1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, gFontSmall);
-        RECT p2{588, 414, 925, 438}; DrawTextW(dc, L"WhatsApp e Telegram começam protegidos.", -1, &p2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT p2{588, 414, 925, 438};
+        DrawTextW(dc, L"WhatsApp e Telegram começam protegidos.", -1, &p2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         drawSectionTitle(dc, 572, 444, L"Prévia da captura");
 
         drawPanel(dc, {20, 666, 960, 736});
         SetTextColor(dc, RGB(199, 238, 215));
         SelectObject(dc, gFontBold);
-        RECT wifi{32, 678, 420, 704}; DrawTextW(dc, L"Rede · aguardando medição", -1, &wifi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT wifi{32, 678, 420, 704};
+        DrawTextW(dc, L"Rede · aguardando medição", -1, &wifi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, gFontSmall);
         SetTextColor(dc, kMuted);
-        RECT q{32, 704, 480, 726}; DrawTextW(dc, L"30 fps · Prévia em baixa taxa para economizar recursos", -1, &q, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT q{32, 704, 480, 726};
+        DrawTextW(dc, L"30 fps · Prévia em baixa taxa para economizar recursos", -1, &q, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         SelectObject(dc, old);
         EndPaint(hwnd, &ps);
@@ -742,9 +795,16 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case kReceiverMessage: {
-        const int count = static_cast<int>(wp);
-        SetWindowTextW(g.receivers, (std::to_wstring(count) + L" conectados").c_str());
-        if (g.activeProtectedMode && count > 1) {
+        const int raw = static_cast<int>(wp);
+        if (raw == 0) {
+            SetWindowTextW(g.receivers, L"Nenhum receptor");
+        } else if (g.additionalConnectionLock.load()) {
+            SetWindowTextW(g.receivers, L"Conexão adicional");
+        } else {
+            SetWindowTextW(g.receivers, L"Receptor detectado");
+        }
+
+        if (g.activeProtectedMode && g.additionalConnectionLock.load()) {
             FLASHWINFO flash{sizeof(flash), hwnd, FLASHW_TRAY, 1, 0};
             FlashWindowEx(&flash);
         }
@@ -764,7 +824,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CLOSE:
         if (g.running.load()) {
-            if (MessageBoxW(hwnd, L"Há uma transmissão ativa. Deseja parar e sair?", L"Transmissão ativa", MB_YESNO | MB_ICONQUESTION) != IDYES)
+            if (MessageBoxW(hwnd, L"Há uma transmissão ativa. Deseja parar e sair?",
+                L"Transmissão ativa", MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
             stopTransmission();
         }
@@ -777,6 +838,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PostQuitMessage(0);
         return 0;
     }
+
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 }
@@ -792,10 +854,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
 
     LOGFONTW lf{};
     wcscpy_s(lf.lfFaceName, L"Segoe UI");
-    lf.lfHeight = -16; gFont = CreateFontIndirectW(&lf);
-    lf.lfHeight = -14; gFontSmall = CreateFontIndirectW(&lf);
-    lf.lfHeight = -16; lf.lfWeight = FW_SEMIBOLD; gFontBold = CreateFontIndirectW(&lf);
-    lf.lfHeight = -23; lf.lfWeight = FW_SEMIBOLD; gFontTitle = CreateFontIndirectW(&lf);
+    lf.lfHeight = -16;
+    gFont = CreateFontIndirectW(&lf);
+    lf.lfHeight = -14;
+    gFontSmall = CreateFontIndirectW(&lf);
+    lf.lfHeight = -16;
+    lf.lfWeight = FW_SEMIBOLD;
+    gFontBold = CreateFontIndirectW(&lf);
+    lf.lfHeight = -23;
+    gFontTitle = CreateFontIndirectW(&lf);
 
     WNDCLASSEXW previewClass{sizeof(previewClass)};
     previewClass.lpfnWndProc = previewProc;
@@ -817,7 +884,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
 
     HWND hwnd = CreateWindowExW(0, kWindowClass, L"Transmissor NDI Portátil — V3",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1000, 790, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 1000, 790,
+        nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
 
     ShowWindow(hwnd, show);
