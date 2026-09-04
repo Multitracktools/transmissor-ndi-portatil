@@ -136,7 +136,7 @@ using NdiLoadFunction = const NDIlib_v6* (*)();
 
 void transmit(MonitorInfo monitor, std::string sourceName, bool showCursor) {
     const auto dllPath = executableDirectory() / L"Processing.NDI.Lib.x64.dll";
-    HMODULE ndiModule = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+    HMODULE ndiModule = LoadLibraryW(dllPath.c_str());
     if (!ndiModule) {
         postStatus(L"Erro: biblioteca NDI ausente ou bloqueada. Consulte o log.");
         g_app.running = false;
