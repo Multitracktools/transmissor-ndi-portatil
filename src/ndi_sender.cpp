@@ -1,11 +1,19 @@
 #include "ndi_sender.h"
 #include "ip_filter.h"
 #include "protected_ip_ui.h"
+
 #include <windows.h>
+#include <audioclient.h>
 #include <iphlpapi.h>
+#include <ksmedia.h>
+#include <mmdeviceapi.h>
+#include <mmreg.h>
+#include <objbase.h>
 #include <ws2tcpip.h>
 
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -19,6 +27,162 @@ using NdiLoadFunction = const NDIlib_v6* (*)();
 using namespace std::chrono_literals;
 
 std::string gTrustedIp;
+
+class WasapiLoopback {
+public:
+    ~WasapiLoopback() { close(); }
+
+    bool open() {
+        close();
+
+        const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(init)) comInitialized_ = true;
+        else if (init != RPC_E_CHANGED_MODE) return false;
+
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                      __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator_));
+        if (FAILED(hr)) { close(); return false; }
+
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eMultimedia, &device_);
+        if (FAILED(hr)) { close(); return false; }
+
+        hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                               reinterpret_cast<void**>(&audioClient_));
+        if (FAILED(hr)) { close(); return false; }
+
+        hr = audioClient_->GetMixFormat(&format_);
+        if (FAILED(hr) || !format_) { close(); return false; }
+
+        hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                      0, 0, format_, nullptr);
+        if (FAILED(hr)) { close(); return false; }
+
+        hr = audioClient_->GetService(__uuidof(IAudioCaptureClient),
+                                      reinterpret_cast<void**>(&captureClient_));
+        if (FAILED(hr)) { close(); return false; }
+
+        hr = audioClient_->Start();
+        if (FAILED(hr)) { close(); return false; }
+
+        started_ = true;
+        return true;
+    }
+
+    void close() {
+        if (audioClient_ && started_) audioClient_->Stop();
+        started_ = false;
+        if (captureClient_) { captureClient_->Release(); captureClient_ = nullptr; }
+        if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
+        if (device_) { device_->Release(); device_ = nullptr; }
+        if (enumerator_) { enumerator_->Release(); enumerator_ = nullptr; }
+        if (format_) { CoTaskMemFree(format_); format_ = nullptr; }
+        if (comInitialized_) { CoUninitialize(); comInitialized_ = false; }
+    }
+
+    void drain(const NDIlib_v6* api, NDIlib_send_instance_t sender, bool transmit) {
+        if (!started_ || !captureClient_ || !format_ || !api || !sender) return;
+
+        UINT32 packetFrames = 0;
+        while (SUCCEEDED(captureClient_->GetNextPacketSize(&packetFrames)) && packetFrames > 0) {
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            if (FAILED(captureClient_->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+
+            if (transmit && frames > 0) sendPacket(api, sender, data, frames, flags);
+            captureClient_->ReleaseBuffer(frames);
+            packetFrames = 0;
+        }
+    }
+
+private:
+    bool formatIsFloat() const {
+        if (!format_) return false;
+        if (format_->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+        if (format_->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
+        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format_);
+        return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != FALSE;
+    }
+
+    bool formatIsPcm() const {
+        if (!format_) return false;
+        if (format_->wFormatTag == WAVE_FORMAT_PCM) return true;
+        if (format_->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
+        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format_);
+        return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) != FALSE;
+    }
+
+    float readSample(const BYTE* data, size_t sampleIndex) const {
+        if (!format_ || !data) return 0.0f;
+        const int bits = format_->wBitsPerSample;
+        const size_t bytesPerSample = static_cast<size_t>((bits + 7) / 8);
+        const BYTE* p = data + sampleIndex * bytesPerSample;
+
+        if (formatIsFloat() && bits == 32) {
+            float value = 0.0f;
+            std::memcpy(&value, p, sizeof(value));
+            return value;
+        }
+        if (!formatIsPcm()) return 0.0f;
+
+        if (bits == 8) {
+            return (static_cast<int>(*p) - 128) / 128.0f;
+        }
+        if (bits == 16) {
+            std::int16_t value = 0;
+            std::memcpy(&value, p, sizeof(value));
+            return static_cast<float>(value) / 32768.0f;
+        }
+        if (bits == 24) {
+            std::int32_t value = static_cast<std::int32_t>(p[0]) |
+                                 (static_cast<std::int32_t>(p[1]) << 8) |
+                                 (static_cast<std::int32_t>(p[2]) << 16);
+            if (value & 0x00800000) value |= static_cast<std::int32_t>(0xFF000000);
+            return static_cast<float>(value) / 8388608.0f;
+        }
+        if (bits == 32) {
+            std::int32_t value = 0;
+            std::memcpy(&value, p, sizeof(value));
+            return static_cast<float>(static_cast<double>(value) / 2147483648.0);
+        }
+        return 0.0f;
+    }
+
+    void sendPacket(const NDIlib_v6* api, NDIlib_send_instance_t sender,
+                    const BYTE* data, UINT32 frames, DWORD flags) {
+        const int channels = static_cast<int>(format_->nChannels);
+        if (channels <= 0 || frames == 0) return;
+
+        std::vector<float> planar(static_cast<size_t>(channels) * frames, 0.0f);
+        if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) == 0 && data) {
+            for (UINT32 frame = 0; frame < frames; ++frame) {
+                for (int ch = 0; ch < channels; ++ch) {
+                    const size_t interleaved = static_cast<size_t>(frame) * channels + static_cast<size_t>(ch);
+                    planar[static_cast<size_t>(ch) * frames + frame] = readSample(data, interleaved);
+                }
+            }
+        }
+
+        NDIlib_audio_frame_v2_t audio{};
+        audio.sample_rate = static_cast<int>(format_->nSamplesPerSec);
+        audio.no_channels = channels;
+        audio.no_samples = static_cast<int>(frames);
+        audio.timecode = NDIlib_send_timecode_synthesize;
+        audio.p_data = planar.data();
+        audio.channel_stride_in_bytes = static_cast<int>(frames * sizeof(float));
+        api->send_send_audio_v2(sender, &audio);
+    }
+
+    bool comInitialized_{false};
+    bool started_{false};
+    IMMDeviceEnumerator* enumerator_{};
+    IMMDevice* device_{};
+    IAudioClient* audioClient_{};
+    IAudioCaptureClient* captureClient_{};
+    WAVEFORMATEX* format_{};
+};
+
+WasapiLoopback gAudioCapture;
 
 std::filesystem::path executableDirectory() {
     std::vector<wchar_t> buffer(32768);
@@ -74,6 +238,7 @@ void logRemoteEndpoints(int ndiConnections) {
     snapshot << "NDI technical connections: " << ndiConnections << "\n";
     snapshot << "Configured trusted IP: " << (gTrustedIp.empty() ? "(none - quick mode)" : gTrustedIp) << "\n";
     snapshot << "Selective IP filter: " << (receiverIpFilterActive() ? "ACTIVE" : "inactive") << "\n";
+    snapshot << "System audio: " << (audioTransmissionAllowed() ? "sending" : "muted") << "\n";
 
     int ownedRows = 0;
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
@@ -151,10 +316,15 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
             return false;
         }
     }
+
+    // O áudio é capturado por loopback WASAPI da saída padrão do Windows.
+    // Falha de áudio não impede a transmissão de vídeo.
+    gAudioCapture.open();
     return true;
 }
 
 void NdiSender::close() {
+    gAudioCapture.close();
     removeReceiverIpFilter();
     gTrustedIp.clear();
     auto* api = static_cast<const NDIlib_v6*>(api_);
@@ -169,6 +339,8 @@ void NdiSender::close() {
 bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int fps) {
     auto* api = static_cast<const NDIlib_v6*>(api_);
     if (!api || !sender_ || !data || width <= 0 || height <= 0 || fps <= 0) return false;
+    auto sender = static_cast<NDIlib_send_instance_t>(sender_);
+
     NDIlib_video_frame_v2_t frame{};
     frame.xres = width;
     frame.yres = height;
@@ -180,7 +352,11 @@ bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int f
     frame.timecode = NDIlib_send_timecode_synthesize;
     frame.p_data = const_cast<std::uint8_t*>(data);
     frame.line_stride_in_bytes = width * 4;
-    api->send_send_video_v2(static_cast<NDIlib_send_instance_t>(sender_), &frame);
+    api->send_send_video_v2(sender, &frame);
+
+    // Mantém o loopback drenado o tempo todo, mas só envia áudio quando a imagem
+    // também está autorizada. No modo protegido e durante privacidade o áudio fica mudo.
+    gAudioCapture.drain(api, sender, audioTransmissionAllowed());
     return true;
 }
 
