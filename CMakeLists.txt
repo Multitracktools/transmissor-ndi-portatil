@@ -42,6 +42,8 @@ target_link_libraries(transmissor-ndi PRIVATE
   iphlpapi
   ws2_32
   fwpuclnt
+  ole32
+  uuid
 )
 
 if(MSVC)
