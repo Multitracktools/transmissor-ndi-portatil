@@ -76,14 +76,10 @@ jobs:
           Copy-Item "README-TESTE.txt" "dist\LEIA-ME.txt"
           Copy-Item "THIRD_PARTY_NOTICES.md" "dist\AVISOS-DE-TERCEIROS.txt"
 
-          Compress-Archive `
-            -Path "dist\*" `
-            -DestinationPath "Transmissor-NDI-Portatil-Windows-x64.zip"
-
       - name: Publicar artifact de teste
         uses: actions/upload-artifact@v4
         with:
           name: Transmissor-NDI-Portatil-Windows-x64
-          path: Transmissor-NDI-Portatil-Windows-x64.zip
+          path: dist/*
           if-no-files-found: error
           retention-days: 30
