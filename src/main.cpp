@@ -99,6 +99,7 @@ struct UiState {
     std::atomic_int rawConnections{0};
     std::atomic_int baselineConnections{0};
     bool activeProtectedMode{true};
+    bool closeAfterWorker{false};
 
     std::thread worker;
     std::mutex workerMutex;
@@ -312,8 +313,15 @@ void collectSettings() {
 
 void updateControls() {
     const bool running = g.running.load();
-    EnableWindow(g.start, TRUE);
-    SetWindowTextW(g.start, running ? L"Parar transmissão" : L"Iniciar transmissão");
+    const bool stopping = g.stopRequested.load();
+
+    if (stopping) {
+        EnableWindow(g.start, FALSE);
+        SetWindowTextW(g.start, L"Parando...");
+    } else {
+        EnableWindow(g.start, TRUE);
+        SetWindowTextW(g.start, running ? L"Parar transmissão" : L"Iniciar transmissão");
+    }
 
     EnableWindow(g.sourceName, !running);
     EnableWindow(g.captureKind, !running);
@@ -328,7 +336,7 @@ void updateControls() {
     const int baseline = g.baselineConnections.load();
     const bool extraLock = g.additionalConnectionLock.load();
     const bool groupIsSafe = raw > 0 && (baseline == 0 || raw <= baseline);
-    const bool canRelease = running && g.activeProtectedMode && !g.authorized.load() && groupIsSafe;
+    const bool canRelease = running && !stopping && g.activeProtectedMode && !g.authorized.load() && groupIsSafe;
     EnableWindow(g.release, canRelease);
 
     if (g.release) {
@@ -586,7 +594,7 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
 }
 
 void startTransmission() {
-    if (g.running.load()) return;
+    if (g.running.load() || g.stopRequested.load()) return;
     const std::wstring sourceName = getText(g.sourceName);
     if (sourceName.empty()) {
         MessageBoxW(g.window, L"Informe um nome para a fonte NDI.", L"Transmissor NDI", MB_OK | MB_ICONWARNING);
@@ -610,6 +618,7 @@ void startTransmission() {
     g.baselineConnections = 0;
     g.stopRequested = false;
     g.running = true;
+    g.closeAfterWorker = false;
     updateControls();
     InvalidateRect(g.window, nullptr, FALSE);
 
@@ -619,7 +628,7 @@ void startTransmission() {
 }
 
 void releaseTransmission() {
-    if (!g.running.load() || !g.activeProtectedMode) return;
+    if (!g.running.load() || g.stopRequested.load() || !g.activeProtectedMode) return;
     const int raw = g.rawConnections.load();
     const int baseline = g.baselineConnections.load();
     if (raw <= 0 || (baseline > 0 && raw > baseline)) return;
@@ -632,12 +641,9 @@ void releaseTransmission() {
 }
 
 void stopTransmission() {
-    if (!g.running.load()) return;
+    if (!g.running.load() || g.stopRequested.load()) return;
     g.stopRequested = true;
-    SetWindowTextW(g.start, L"Parando...");
-    EnableWindow(g.start, FALSE);
-    std::lock_guard<std::mutex> lock(g.workerMutex);
-    if (g.worker.joinable()) g.worker.join();
+    postStatus(L"Parando transmissão...");
     updateControls();
     InvalidateRect(g.window, nullptr, FALSE);
 }
@@ -822,7 +828,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT envio{510, 103, 690, 130};
         DrawTextW(dc, L"— Mbps", -1, &envio, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT perf{748, 103, 930, 130};
-        const wchar_t* perfText = g.privacyBlocked.load() ? L"Privacidade ativa" : (g.running.load() ? L"Em transmissão" : L"Aguardando");
+        const wchar_t* perfText = g.stopRequested.load() ? L"Encerrando" :
+            (g.privacyBlocked.load() ? L"Privacidade ativa" : (g.running.load() ? L"Em transmissão" : L"Aguardando"));
         DrawTextW(dc, perfText, -1, &perf, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         drawPanel(dc, {20, 158, 536, 654});
@@ -902,20 +909,28 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case kWorkerEnded:
+    case kWorkerEnded: {
         if (g.worker.joinable()) {
             std::lock_guard<std::mutex> lock(g.workerMutex);
             if (g.worker.joinable()) g.worker.join();
         }
         updateControls();
         InvalidateRect(hwnd, nullptr, FALSE);
+        if (g.closeAfterWorker) {
+            g.closeAfterWorker = false;
+            collectSettings();
+            DestroyWindow(hwnd);
+        }
         return 0;
+    }
 
     case WM_CLOSE:
         if (g.running.load()) {
             if (MessageBoxW(hwnd, L"Há uma transmissão ativa. Deseja parar e sair?", L"Transmissão ativa", MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
+            g.closeAfterWorker = true;
             stopTransmission();
+            return 0;
         }
         collectSettings();
         DestroyWindow(hwnd);
