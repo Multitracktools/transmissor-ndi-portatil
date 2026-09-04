@@ -1,5 +1,6 @@
 #include "ndi_sender.h"
 #include "ip_filter.h"
+#include "protected_ip_ui.h"
 #include <windows.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
@@ -116,10 +117,9 @@ void logRemoteEndpoints(int ndiConnections) {
 
 NdiSender::~NdiSender() { close(); }
 
-bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string& sourceName,
-                     const std::string& trustedIpv4, std::wstring& error) {
+bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string& sourceName, std::wstring& error) {
     close();
-    gTrustedIp = trustedIpv4;
+    gTrustedIp = configuredReceiverIp();
     HMODULE module = LoadLibraryW(runtimeDll.c_str());
     if (!module) { error = L"Não foi possível carregar Processing.NDI.Lib.x64.dll."; return false; }
     auto load = reinterpret_cast<NdiLoadFunction>(GetProcAddress(module, "NDIlib_v6_load"));
