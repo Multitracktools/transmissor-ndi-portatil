@@ -21,7 +21,17 @@ target_compile_definitions(transmissor-ndi PRIVATE
 )
 
 target_include_directories(transmissor-ndi PRIVATE third_party/ndi/include)
-target_link_libraries(transmissor-ndi PRIVATE user32 gdi32 comctl32 shell32)
+target_link_libraries(transmissor-ndi PRIVATE
+  user32
+  gdi32
+  comctl32
+  shell32
+  dwmapi
+  uxtheme
+  advapi32
+  iphlpapi
+  wlanapi
+)
 
 if(MSVC)
   target_compile_options(transmissor-ndi PRIVATE /W4 /permissive- /utf-8 /EHsc)
