@@ -72,31 +72,43 @@ bool installReceiverIpFilter(const std::string& allowedIpv4, std::wstring& error
         return false;
     }
 
-    FWPM_FILTER_CONDITION0 allowConditions[2]{};
+    // O NDI usa tráfego UDP/multicast para descoberta. Se bloquearmos todo o tráfego
+    // do processo para outros IPs, a fonte deixa de aparecer nos receptores.
+    // Portanto o filtro seletivo atua somente em TCP, que é onde observamos as
+    // conexões de mídia/controle dos receptores no teste real.
+    FWPM_FILTER_CONDITION0 allowConditions[3]{};
     allowConditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
     allowConditions[0].matchType = FWP_MATCH_EQUAL;
     allowConditions[0].conditionValue.type = FWP_BYTE_BLOB_TYPE;
     allowConditions[0].conditionValue.byteBlob = appId;
-    allowConditions[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    allowConditions[1].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
     allowConditions[1].matchType = FWP_MATCH_EQUAL;
-    allowConditions[1].conditionValue.type = FWP_UINT32;
-    allowConditions[1].conditionValue.uint32 = allowed;
+    allowConditions[1].conditionValue.type = FWP_UINT8;
+    allowConditions[1].conditionValue.uint8 = IPPROTO_TCP;
+    allowConditions[2].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    allowConditions[2].matchType = FWP_MATCH_EQUAL;
+    allowConditions[2].conditionValue.type = FWP_UINT32;
+    allowConditions[2].conditionValue.uint32 = allowed;
 
-    FWPM_FILTER_CONDITION0 blockCondition{};
-    blockCondition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
-    blockCondition.matchType = FWP_MATCH_EQUAL;
-    blockCondition.conditionValue.type = FWP_BYTE_BLOB_TYPE;
-    blockCondition.conditionValue.byteBlob = appId;
+    FWPM_FILTER_CONDITION0 blockConditions[2]{};
+    blockConditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    blockConditions[0].matchType = FWP_MATCH_EQUAL;
+    blockConditions[0].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+    blockConditions[0].conditionValue.byteBlob = appId;
+    blockConditions[1].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+    blockConditions[1].matchType = FWP_MATCH_EQUAL;
+    blockConditions[1].conditionValue.type = FWP_UINT8;
+    blockConditions[1].conditionValue.uint8 = IPPROTO_TCP;
 
     bool ok = true;
-    ok = ok && addFilter(allowConditions, 2, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-                         FWP_ACTION_PERMIT, 0xF000000000000000ULL, L"NDI permitir IP autorizado (entrada)", error);
-    ok = ok && addFilter(&blockCondition, 1, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-                         FWP_ACTION_BLOCK, 0x1000000000000000ULL, L"NDI bloquear outros IPs (entrada)", error);
-    ok = ok && addFilter(allowConditions, 2, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                         FWP_ACTION_PERMIT, 0xF000000000000000ULL, L"NDI permitir IP autorizado (saída)", error);
-    ok = ok && addFilter(&blockCondition, 1, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                         FWP_ACTION_BLOCK, 0x1000000000000000ULL, L"NDI bloquear outros IPs (saída)", error);
+    ok = ok && addFilter(allowConditions, 3, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+                         FWP_ACTION_PERMIT, 0xF000000000000000ULL, L"NDI permitir TCP do IP autorizado (entrada)", error);
+    ok = ok && addFilter(blockConditions, 2, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+                         FWP_ACTION_BLOCK, 0x1000000000000000ULL, L"NDI bloquear TCP de outros IPs (entrada)", error);
+    ok = ok && addFilter(allowConditions, 3, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                         FWP_ACTION_PERMIT, 0xF000000000000000ULL, L"NDI permitir TCP do IP autorizado (saída)", error);
+    ok = ok && addFilter(blockConditions, 2, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                         FWP_ACTION_BLOCK, 0x1000000000000000ULL, L"NDI bloquear TCP de outros IPs (saída)", error);
 
     FwpmFreeMemory0(reinterpret_cast<void**>(&appId));
     if (!ok) removeReceiverIpFilter();
