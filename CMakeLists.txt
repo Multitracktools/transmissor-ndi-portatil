@@ -19,12 +19,13 @@ target_compile_definitions(transmissor-ndi PRIVATE
   PROCESSINGNDILIB_STATIC
   NDILIB_CPP_DEFAULT_CONSTRUCTORS=0
 )
+
 target_include_directories(transmissor-ndi PRIVATE third_party/ndi/include)
 target_link_libraries(transmissor-ndi PRIVATE user32 gdi32 comctl32 shell32)
 
 if(MSVC)
   target_compile_options(transmissor-ndi PRIVATE /W4 /permissive- /utf-8 /EHsc)
-  target_link_options(transmissor-ndi PRIVATE /SUBSYSTEM:WINDOWS)
+  target_link_options(transmissor-ndi PRIVATE /SUBSYSTEM:WINDOWS /MANIFEST:NO)
 endif()
 
 set_target_properties(transmissor-ndi PROPERTIES
