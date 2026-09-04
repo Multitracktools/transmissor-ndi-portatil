@@ -1,9 +1,17 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#include <shellapi.h>
+#include <uxtheme.h>
+#include <wlanapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -15,618 +23,106 @@
 #include "Processing.NDI.Lib.h"
 
 namespace {
+constexpr wchar_t kWindowClass[] = L"ZosmaTransmissorNdiWindow";
+constexpr wchar_t kHelpClass[] = L"ZosmaTransmissorNdiHelpWindow";
+constexpr wchar_t kRegistryPath[] = L"Software\\Zosma Labs\\Transmissor NDI Portatil";
+constexpr wchar_t kWebsite[] = L"https://zosma.com.br";
+constexpr UINT kWorkerUpdate = WM_APP + 1;
+constexpr UINT kWorkerFinished = WM_APP + 2;
+constexpr UINT_PTR kUiTimer = 1;
 
-constexpr wchar_t kWindowClass[] = L"TransmissorNDIPortatilWindow";
-constexpr UINT kStatusMessage = WM_APP + 1;
-
-enum ControlId {
-    IdSourceName = 1001,
-    IdSourceType,
-    IdCaptureSource,
-    IdRefreshSources,
-    IdCursor,
-    IdStart,
-    IdStop,
-    IdStatus
-};
-
-struct MonitorInfo {
-    HMONITOR handle{};
-    RECT bounds{};
-    std::wstring label;
-};
-
-struct WindowInfo {
-    HWND handle{};
-    RECT bounds{};
-    std::wstring label;
-};
-
-enum class CaptureKind {
-    Monitor,
-    Window
-};
-
-struct CaptureTarget {
-    CaptureKind kind{CaptureKind::Monitor};
-    RECT bounds{};
-    HWND window{};
-    std::wstring label;
-};
+enum ControlId { IdSourceName=1001, IdSourceType, IdCaptureSource, IdRefreshSources, IdCursor,
+ IdProtectedMode, IdFastMode, IdAllowWhatsapp, IdAllowTelegram, IdRelease, IdStartStop, IdHelp,
+ IdWebsite, IdDontShowHelp, IdStatus, IdReceivers, IdNetwork, IdPerformance, IdPermissionNote };
+enum class CaptureKind { Monitor, Window };
+enum class PrivacyReason { None, Waiting, ExtraReceiver, PrivateApplication };
+struct MonitorInfo { HMONITOR handle{}; RECT bounds{}; std::wstring label; };
+struct WindowInfo { HWND handle{}; RECT bounds{}; std::wstring label; };
+struct CaptureTarget { CaptureKind kind{CaptureKind::Monitor}; RECT bounds{}; HWND window{}; };
 
 struct AppState {
-    HWND window{};
-    HWND sourceName{};
-    HWND sourceTypeCombo{};
-    HWND captureSourceCombo{};
-    HWND refreshButton{};
-    HWND cursorCheckbox{};
-    HWND startButton{};
-    HWND stopButton{};
-    HWND statusLabel{};
-    std::vector<MonitorInfo> monitors;
-    std::vector<WindowInfo> windows;
-    std::thread worker;
-    std::atomic_bool stopRequested{false};
-    std::atomic_bool running{false};
-    std::mutex workerMutex;
-};
-
-AppState g_app;
+ HWND window{}, helpWindow{};
+ HWND sourceName{}, sourceType{}, captureSource{}, refresh{}, cursor{}, protectedMode{}, fastMode{};
+ HWND allowWhatsapp{}, allowTelegram{}, release{}, startStop{}, help{}, website{};
+ HWND status{}, receivers{}, network{}, performance{}, permissionNote{}, accessCount{}, accessMessage{};
+ std::vector<MonitorInfo> monitors; std::vector<WindowInfo> windows;
+ std::thread worker; std::mutex workerMutex;
+ std::atomic_bool stopRequested{false}, running{false}, releaseRequested{false}, extraReceiverLock{false};
+ std::atomic_bool allowWhatsappNow{false}, allowTelegramNow{false};
+ std::atomic_int receiverCount{0}, measuredFps{0};
+ std::atomic<PrivacyReason> privacyReason{PrivacyReason::None};
+ bool protectedModeSelected{true}, dontShowHelp{false};
+ HFONT font{}, fontSmall{}, fontTitle{}, fontLarge{}; HBRUSH backgroundBrush{}, editBrush{};
+ COLORREF backgroundColor{RGB(16,20,27)}, textColor{RGB(241,245,251)}, mutedColor{RGB(158,169,188)};
+ ULONGLONG previousNetworkBytes{}; std::chrono::steady_clock::time_point previousNetworkTime{}; double networkMbps{};
+} g_app;
 
 std::filesystem::path executableDirectory() {
-    std::vector<wchar_t> path(32768);
-    const DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    return std::filesystem::path(std::wstring(path.data(), size)).parent_path();
+ std::vector<wchar_t> path(32768); DWORD n=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
+ return std::filesystem::path(std::wstring(path.data(),n)).parent_path();
 }
-
 void logLine(const std::wstring& message) {
-    std::wofstream log(executableDirectory() / L"transmissor-ndi.log", std::ios::app);
-    if (!log) return;
-
-    SYSTEMTIME time{};
-    GetLocalTime(&time);
-    log << L'[' << time.wYear << L'-' << time.wMonth << L'-' << time.wDay << L' '
-        << time.wHour << L':' << time.wMinute << L':' << time.wSecond << L"] "
-        << message << L'\n';
+ std::wofstream log(executableDirectory()/L"transmissor-ndi.log",std::ios::app); if(!log)return;
+ SYSTEMTIME t{}; GetLocalTime(&t); log<<L'['<<t.wYear<<L'-'<<t.wMonth<<L'-'<<t.wDay<<L' '<<t.wHour<<L':'<<t.wMinute<<L':'<<t.wSecond<<L"] "<<message<<L'\n';
 }
-
 std::string utf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                                         nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                        result.data(), size, nullptr, nullptr);
-    return result;
+ if(value.empty())return{}; int n=WideCharToMultiByte(CP_UTF8,0,value.data(),static_cast<int>(value.size()),nullptr,0,nullptr,nullptr);
+ std::string out(static_cast<size_t>(n),'\0'); WideCharToMultiByte(CP_UTF8,0,value.data(),static_cast<int>(value.size()),out.data(),n,nullptr,nullptr); return out;
+}
+std::wstring lower(std::wstring value){std::transform(value.begin(),value.end(),value.begin(),[](wchar_t c){return static_cast<wchar_t>(std::towlower(c));});return value;}
+bool containsAny(const std::wstring& text,std::initializer_list<const wchar_t*> terms){auto s=lower(text);for(auto* term:terms)if(s.find(term)!=std::wstring::npos)return true;return false;}
+void setText(HWND c,const std::wstring& s){if(c)SetWindowTextW(c,s.c_str());}
+
+void writeDword(const wchar_t* name,DWORD value){HKEY k{};if(RegCreateKeyExW(HKEY_CURRENT_USER,kRegistryPath,0,nullptr,0,KEY_WRITE,nullptr,&k,nullptr)==ERROR_SUCCESS){RegSetValueExW(k,name,0,REG_DWORD,reinterpret_cast<BYTE*>(&value),sizeof(value));RegCloseKey(k);}}
+DWORD readDword(const wchar_t* name,DWORD fallback){HKEY k{};DWORD value{},bytes=sizeof(value),type{};if(RegOpenKeyExW(HKEY_CURRENT_USER,kRegistryPath,0,KEY_READ,&k)==ERROR_SUCCESS){LONG r=RegQueryValueExW(k,name,nullptr,&type,reinterpret_cast<BYTE*>(&value),&bytes);RegCloseKey(k);if(r==ERROR_SUCCESS&&type==REG_DWORD)return value;}return fallback;}
+void writeString(const wchar_t* name,const std::wstring& value){HKEY k{};if(RegCreateKeyExW(HKEY_CURRENT_USER,kRegistryPath,0,nullptr,0,KEY_WRITE,nullptr,&k,nullptr)==ERROR_SUCCESS){RegSetValueExW(k,name,0,REG_SZ,reinterpret_cast<const BYTE*>(value.c_str()),static_cast<DWORD>((value.size()+1)*sizeof(wchar_t)));RegCloseKey(k);}}
+std::wstring readString(const wchar_t* name,const wchar_t* fallback){HKEY k{};wchar_t v[512]{};DWORD bytes=sizeof(v),type{};if(RegOpenKeyExW(HKEY_CURRENT_USER,kRegistryPath,0,KEY_READ,&k)==ERROR_SUCCESS){LONG r=RegQueryValueExW(k,name,nullptr,&type,reinterpret_cast<BYTE*>(v),&bytes);RegCloseKey(k);if(r==ERROR_SUCCESS&&type==REG_SZ)return v;}return fallback;}
+
+BOOL CALLBACK monitorCallback(HMONITOR h,HDC,LPRECT r,LPARAM p){auto* v=reinterpret_cast<std::vector<MonitorInfo>*>(p);MONITORINFOEXW i{};i.cbSize=sizeof(i);GetMonitorInfoW(h,&i);int n=static_cast<int>(v->size())+1;std::wstring label=L"Monitor "+std::to_wstring(n)+L" — "+std::to_wstring(r->right-r->left)+L" × "+std::to_wstring(r->bottom-r->top);if(i.dwFlags&MONITORINFOF_PRIMARY)label+=L" (principal)";v->push_back({h,*r,std::move(label)});return TRUE;}
+BOOL CALLBACK windowCallback(HWND h,LPARAM p){if(h==g_app.window||h==g_app.helpWindow||!IsWindowVisible(h)||IsIconic(h))return TRUE;int n=GetWindowTextLengthW(h);if(n<=0)return TRUE;std::wstring title(static_cast<size_t>(n)+1,L'\0');GetWindowTextW(h,title.data(),n+1);title.resize(static_cast<size_t>(n));RECT r{};if(!GetWindowRect(h,&r)||r.right<=r.left||r.bottom<=r.top)return TRUE;reinterpret_cast<std::vector<WindowInfo>*>(p)->push_back({h,r,std::move(title)});return TRUE;}
+CaptureKind selectedKind(){return SendMessageW(g_app.sourceType,CB_GETCURSEL,0,0)==1?CaptureKind::Window:CaptureKind::Monitor;}
+void loadSources(){SendMessageW(g_app.captureSource,CB_RESETCONTENT,0,0);if(selectedKind()==CaptureKind::Monitor){g_app.monitors.clear();EnumDisplayMonitors(nullptr,nullptr,monitorCallback,reinterpret_cast<LPARAM>(&g_app.monitors));for(auto& x:g_app.monitors)SendMessageW(g_app.captureSource,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(x.label.c_str()));}else{g_app.windows.clear();EnumWindows(windowCallback,reinterpret_cast<LPARAM>(&g_app.windows));for(auto& x:g_app.windows)SendMessageW(g_app.captureSource,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(x.label.c_str()));}if(SendMessageW(g_app.captureSource,CB_GETCOUNT,0,0)>0)SendMessageW(g_app.captureSource,CB_SETCURSEL,0,0);}
+
+std::wstring processPath(HWND h){DWORD id{};GetWindowThreadProcessId(h,&id);HANDLE p=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,id);if(!p)return{};std::vector<wchar_t>b(32768);DWORD n=static_cast<DWORD>(b.size());bool ok=QueryFullProcessImageNameW(p,0,b.data(),&n)!=FALSE;CloseHandle(p);return ok?std::wstring(b.data(),n):L"";}
+bool isWhatsapp(HWND h){wchar_t t[1024]{};GetWindowTextW(h,t,static_cast<int>(std::size(t)));return containsAny(t,{L"whatsapp",L"web.whatsapp.com"})||containsAny(processPath(h),{L"whatsapp.exe"});}
+bool isTelegram(HWND h){wchar_t t[1024]{};GetWindowTextW(h,t,static_cast<int>(std::size(t)));return containsAny(t,{L"telegram",L"web.telegram.org"})||containsAny(processPath(h),{L"telegram.exe",L"telegram desktop"});}
+struct PrivacyScan{RECT bounds{};bool found{};};
+BOOL CALLBACK privacyCallback(HWND h,LPARAM p){auto* s=reinterpret_cast<PrivacyScan*>(p);if(!IsWindowVisible(h)||IsIconic(h)||h==g_app.window||h==g_app.helpWindow)return TRUE;RECT r{},overlap{};if(!GetWindowRect(h,&r)||!IntersectRect(&overlap,&r,&s->bounds))return TRUE;if((!g_app.allowWhatsappNow&&isWhatsapp(h))||(!g_app.allowTelegramNow&&isTelegram(h)))s->found=true;return !s->found;}
+bool privateVisible(const CaptureTarget& target){if(g_app.allowWhatsappNow&&g_app.allowTelegramNow)return false;if(target.kind==CaptureKind::Window)return(!g_app.allowWhatsappNow&&isWhatsapp(target.window))||(!g_app.allowTelegramNow&&isTelegram(target.window));PrivacyScan s{};s.bounds=target.bounds;EnumWindows(privacyCallback,reinterpret_cast<LPARAM>(&s));return s.found;}
+
+void drawCursorInto(HDC dc,const RECT& bounds){CURSORINFO c{};c.cbSize=sizeof(c);if(!GetCursorInfo(&c)||c.flags!=CURSOR_SHOWING||!PtInRect(&bounds,c.ptScreenPos))return;ICONINFO i{};int x=c.ptScreenPos.x-bounds.left,y=c.ptScreenPos.y-bounds.top;if(GetIconInfo(c.hCursor,&i)){x-=static_cast<int>(i.xHotspot);y-=static_cast<int>(i.yHotspot);if(i.hbmMask)DeleteObject(i.hbmMask);if(i.hbmColor)DeleteObject(i.hbmColor);}DrawIconEx(dc,x,y,c.hCursor,0,0,0,nullptr,DI_NORMAL);}
+void drawPrivacy(HDC dc,int w,int h,PrivacyReason reason,const std::wstring& name){RECT r{0,0,w,h};HBRUSH b=CreateSolidBrush(RGB(8,12,20));FillRect(dc,&r,b);DeleteObject(b);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(241,245,251));int ts=std::max(24,h/22);HFONT title=CreateFontW(-ts,0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");HFONT normal=CreateFontW(-std::max(15,h/40),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");HGDIOBJ old=SelectObject(dc,title);std::wstring heading,detail;if(reason==PrivacyReason::Waiting){heading=L"Transmissão protegida";detail=L"Aguardando autorização no computador transmissor.";}else if(reason==PrivacyReason::ExtraReceiver){heading=L"Transmissão temporariamente bloqueada";detail=L"Foi detectada uma conexão adicional.";}else{heading=L"Conteúdo protegido";detail=L"Um aplicativo privado está aberto no monitor compartilhado.";}RECT a{40,h/2-ts*2,w-40,h/2};DrawTextW(dc,heading.c_str(),-1,&a,DT_CENTER|DT_VCENTER|DT_SINGLELINE);SelectObject(dc,normal);SetTextColor(dc,RGB(158,169,188));RECT d{40,h/2,w-40,h/2+ts*2};DrawTextW(dc,detail.c_str(),-1,&d,DT_CENTER|DT_TOP|DT_SINGLELINE);std::wstring footer=name+L"  ·  Zosma Labs";RECT f{30,h-62,w-30,h-22};DrawTextW(dc,footer.c_str(),-1,&f,DT_CENTER|DT_BOTTOM|DT_SINGLELINE);SelectObject(dc,old);DeleteObject(title);DeleteObject(normal);}
+
+using NdiLoadFunction=const NDIlib_v6*(*)();
+void transmit(CaptureTarget target,std::wstring sourceName,bool showCursor,bool protectedMode){
+ HMODULE module=LoadLibraryW((executableDirectory()/L"Processing.NDI.Lib.x64.dll").c_str());if(!module){logLine(L"Biblioteca NDI ausente.");PostMessageW(g_app.window,kWorkerFinished,1,0);return;}
+ auto load=reinterpret_cast<NdiLoadFunction>(GetProcAddress(module,"NDIlib_v6_load"));const NDIlib_v6* ndi=load?load():nullptr;if(!ndi||!ndi->initialize()){FreeLibrary(module);PostMessageW(g_app.window,kWorkerFinished,2,0);return;}
+ std::string utf8Name=utf8(sourceName);NDIlib_send_create_t c{};c.p_ndi_name=utf8Name.c_str();c.clock_video=true;c.clock_audio=false;auto sender=ndi->send_create(&c);if(!sender){ndi->destroy();FreeLibrary(module);PostMessageW(g_app.window,kWorkerFinished,3,0);return;}
+ HDC screen=GetDC(nullptr),memory=CreateCompatibleDC(screen);HBITMAP bitmap{};HGDIOBJ original{};void* pixels{};int width{},height{};NDIlib_video_frame_v2_t frame{};
+ auto resize=[&](const RECT& r){int nw=r.right-r.left,nh=r.bottom-r.top;if(nw<=0||nh<=0)return false;if(bitmap&&nw==width&&nh==height)return true;if(bitmap){SelectObject(memory,original);DeleteObject(bitmap);}BITMAPINFO i{};i.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);i.bmiHeader.biWidth=nw;i.bmiHeader.biHeight=-nh;i.bmiHeader.biPlanes=1;i.bmiHeader.biBitCount=32;i.bmiHeader.biCompression=BI_RGB;bitmap=CreateDIBSection(screen,&i,DIB_RGB_COLORS,&pixels,nullptr,0);if(!bitmap||!pixels)return false;HGDIOBJ replaced=SelectObject(memory,bitmap);if(!original)original=replaced;width=nw;height=nh;frame={};frame.xres=width;frame.yres=height;frame.FourCC=NDIlib_FourCC_video_type_BGRX;frame.frame_rate_N=30000;frame.frame_rate_D=1000;frame.picture_aspect_ratio=static_cast<float>(width)/height;frame.frame_format_type=NDIlib_frame_format_type_progressive;frame.timecode=NDIlib_send_timecode_synthesize;frame.p_data=static_cast<uint8_t*>(pixels);frame.line_stride_in_bytes=width*4;return true;};
+ bool ready=screen&&memory&&resize(target.bounds);auto fpsStart=std::chrono::steady_clock::now();auto privacyScanTime=fpsStart-std::chrono::seconds(1);int frames=0,previousConnections=-1;bool privateBlocked=false;PrivacyReason lastDrawnReason=PrivacyReason::None;g_app.privacyReason=protectedMode?PrivacyReason::Waiting:PrivacyReason::None;logLine(L"Transmissão iniciada: "+sourceName);
+ while(ready&&!g_app.stopRequested){RECT bounds=target.bounds;if(target.kind==CaptureKind::Window){if(!IsWindow(target.window)||IsIconic(target.window)||!GetWindowRect(target.window,&bounds)){logLine(L"Janela fechada ou indisponível.");break;}if(!resize(bounds))break;}int connections=ndi->send_get_no_connections(sender,0);g_app.receiverCount=connections;if(connections!=previousConnections){if(protectedMode&&connections>1){g_app.extraReceiverLock=true;g_app.releaseRequested=false;}previousConnections=connections;PostMessageW(g_app.window,kWorkerUpdate,0,0);}auto now=std::chrono::steady_clock::now();if(now-privacyScanTime>=std::chrono::milliseconds(75)){privateBlocked=privateVisible(target);privacyScanTime=now;}PrivacyReason reason=PrivacyReason::None;if(protectedMode&&(connections>1||g_app.extraReceiverLock))reason=PrivacyReason::ExtraReceiver;else if(protectedMode&&!g_app.releaseRequested)reason=PrivacyReason::Waiting;else if(privateBlocked)reason=PrivacyReason::PrivateApplication;g_app.privacyReason=reason;if(reason!=PrivacyReason::None){if(reason!=lastDrawnReason)drawPrivacy(memory,width,height,reason,sourceName);}else{bool captured=false;if(target.kind==CaptureKind::Monitor)captured=BitBlt(memory,0,0,width,height,screen,bounds.left,bounds.top,SRCCOPY|CAPTUREBLT)!=FALSE;else{captured=PrintWindow(target.window,memory,0x00000002)!=FALSE;if(!captured)captured=BitBlt(memory,0,0,width,height,screen,bounds.left,bounds.top,SRCCOPY|CAPTUREBLT)!=FALSE;}if(!captured)break;if(showCursor)drawCursorInto(memory,bounds);}lastDrawnReason=reason;ndi->send_send_video_v2(sender,&frame);++frames;auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(now-fpsStart).count();if(elapsed>=1000){g_app.measuredFps=static_cast<int>(frames*1000/elapsed);frames=0;fpsStart=now;PostMessageW(g_app.window,kWorkerUpdate,0,0);}}
+ if(original)SelectObject(memory,original);if(bitmap)DeleteObject(bitmap);if(memory)DeleteDC(memory);if(screen)ReleaseDC(nullptr,screen);ndi->send_destroy(sender);ndi->destroy();FreeLibrary(module);PostMessageW(g_app.window,kWorkerFinished,0,0);
 }
 
-void postStatus(const std::wstring& status) {
-    auto* copy = new std::wstring(status);
-    if (!PostMessageW(g_app.window, kStatusMessage, 0, reinterpret_cast<LPARAM>(copy))) {
-        delete copy;
-    }
-    logLine(status);
+int wifiSignal(){HANDLE client{};DWORD version{};if(WlanOpenHandle(2,nullptr,&version,&client)!=ERROR_SUCCESS)return-1;PWLAN_INTERFACE_INFO_LIST list{};if(WlanEnumInterfaces(client,nullptr,&list)!=ERROR_SUCCESS){WlanCloseHandle(client,nullptr);return-1;}int signal=-1;for(DWORD i=0;i<list->dwNumberOfItems&&signal<0;++i){DWORD size{};WLAN_OPCODE_VALUE_TYPE type{};PWLAN_CONNECTION_ATTRIBUTES a{};if(WlanQueryInterface(client,&list->InterfaceInfo[i].InterfaceGuid,wlan_intf_opcode_current_connection,nullptr,&size,reinterpret_cast<PVOID*>(&a),&type)==ERROR_SUCCESS){signal=static_cast<int>(a->wlanAssociationAttributes.wlanSignalQuality);WlanFreeMemory(a);}}WlanFreeMemory(list);WlanCloseHandle(client,nullptr);return signal;}
+ULONGLONG networkBytes(){PMIB_IF_TABLE2 table{};ULONGLONG bytes{};if(GetIfTable2(&table)==NO_ERROR){for(ULONG i=0;i<table->NumEntries;++i){auto& r=table->Table[i];if(r.OperStatus==IfOperStatusUp&&r.Type!=IF_TYPE_SOFTWARE_LOOPBACK)bytes+=r.OutOctets;}FreeMibTable(table);}return bytes;}
+void savePreferences(){wchar_t n[512]{};GetWindowTextW(g_app.sourceName,n,static_cast<int>(std::size(n)));writeString(L"SourceName",n);writeDword(L"ProtectedMode",g_app.protectedModeSelected?1:0);writeDword(L"CaptureKind",selectedKind()==CaptureKind::Window?1:0);writeDword(L"ShowCursor",SendMessageW(g_app.cursor,BM_GETCHECK,0,0)==BST_CHECKED?1:0);writeDword(L"DontShowHelp",g_app.dontShowHelp?1:0);}
+void permissionNote(){bool w=SendMessageW(g_app.allowWhatsapp,BM_GETCHECK,0,0)==BST_CHECKED,t=SendMessageW(g_app.allowTelegram,BM_GETCHECK,0,0)==BST_CHECKED;g_app.allowWhatsappNow=w;g_app.allowTelegramNow=t;if(w&&t)setText(g_app.permissionNote,L"WhatsApp e Telegram permitidos durante esta execução.");else if(w)setText(g_app.permissionNote,L"WhatsApp permitido; Telegram continua protegido.");else if(t)setText(g_app.permissionNote,L"Telegram permitido; WhatsApp continua protegido.");else setText(g_app.permissionNote,L"WhatsApp e Telegram protegidos. As permissões são temporárias.");}
+void setMode(bool p){if(g_app.running)return;g_app.protectedModeSelected=p;SendMessageW(g_app.protectedMode,BM_SETCHECK,p?BST_CHECKED:BST_UNCHECKED,0);SendMessageW(g_app.fastMode,BM_SETCHECK,p?BST_UNCHECKED:BST_CHECKED,0);EnableWindow(g_app.release,FALSE);}
+void transmissionControls(bool running){for(HWND c:{g_app.sourceName,g_app.sourceType,g_app.captureSource,g_app.refresh,g_app.cursor,g_app.protectedMode,g_app.fastMode})EnableWindow(c,!running);setText(g_app.startStop,running?L"Parar transmissão":L"Iniciar transmissão");}
+void refreshStatus(){int count=g_app.receiverCount;setText(g_app.receivers,std::to_wstring(count)+(count==1?L" conectado":L" conectados"));setText(g_app.accessCount,std::to_wstring(count));PrivacyReason reason=g_app.privacyReason;std::wstring status=L"Pronto para iniciar",message=L"A fonte enviará uma tela de espera até você liberar o receptor.";if(g_app.running){if(reason==PrivacyReason::ExtraReceiver){status=L"Bloqueada: conexão adicional";message=L"Há mais de um receptor. A imagem está protegida para todos.";}else if(reason==PrivacyReason::Waiting){status=count==1?L"Receptor aguardando liberação":L"Aguardando receptor";message=count==1?L"Um receptor conectado. Confirme para mostrar sua tela.":L"Sua tela ainda não está sendo exibida.";}else if(reason==PrivacyReason::PrivateApplication){status=L"Conteúdo privado ocultado";message=L"O Modo Privacidade está protegendo sua imagem.";}else{status=L"Transmitindo";message=L"A imagem está liberada para o receptor.";}}setText(g_app.status,status);setText(g_app.accessMessage,message);EnableWindow(g_app.release,g_app.running&&g_app.protectedModeSelected&&count==1&&!g_app.releaseRequested);int fps=g_app.measuredFps;std::wstring perf=g_app.running?std::to_wstring(fps)+L" fps · ":L"Aguardando · ";perf+=g_app.running&&fps>0&&fps<25?L"Atenção":(g_app.running?L"Estável":L"Pronto");setText(g_app.performance,perf);}
+void updateNetwork(){auto now=std::chrono::steady_clock::now();ULONGLONG bytes=networkBytes();if(g_app.previousNetworkBytes&&bytes>=g_app.previousNetworkBytes){double sec=std::chrono::duration<double>(now-g_app.previousNetworkTime).count();if(sec>0)g_app.networkMbps=(bytes-g_app.previousNetworkBytes)*8.0/sec/1000000.0;}g_app.previousNetworkBytes=bytes;g_app.previousNetworkTime=now;wchar_t rate[32]{};swprintf_s(rate,L"%.1f Mbps",g_app.networkMbps);int signal=wifiSignal();if(signal>=0)setText(g_app.network,L"Wi-Fi "+std::to_wstring(signal)+L"% · "+(signal>=70?L"forte":signal>=45?L"moderado":L"fraco")+L" · "+rate);else setText(g_app.network,std::wstring(L"Rede cabeada · ")+rate);}
+void stopTransmission(){g_app.stopRequested=true;std::scoped_lock lock(g_app.workerMutex);if(g_app.worker.joinable()&&g_app.worker.get_id()!=std::this_thread::get_id())g_app.worker.join();g_app.running=false;g_app.receiverCount=0;g_app.measuredFps=0;g_app.privacyReason=PrivacyReason::None;transmissionControls(false);refreshStatus();}
+void startTransmission(){if(g_app.running)return;int index=static_cast<int>(SendMessageW(g_app.captureSource,CB_GETCURSEL,0,0));CaptureTarget target{};target.kind=selectedKind();if(target.kind==CaptureKind::Monitor){if(index<0||index>=static_cast<int>(g_app.monitors.size())){MessageBoxW(g_app.window,L"Nenhum monitor foi encontrado.",L"Transmissor NDI® Portátil",MB_ICONWARNING);return;}target.bounds=g_app.monitors[index].bounds;}else{if(index<0||index>=static_cast<int>(g_app.windows.size())){MessageBoxW(g_app.window,L"Selecione uma janela.",L"Transmissor NDI® Portátil",MB_ICONWARNING);return;}target.window=g_app.windows[index].handle;target.bounds=g_app.windows[index].bounds;}wchar_t n[512]{};GetWindowTextW(g_app.sourceName,n,static_cast<int>(std::size(n)));std::wstring name=n[0]?n:L"Tela compartilhada";bool cursor=SendMessageW(g_app.cursor,BM_GETCHECK,0,0)==BST_CHECKED;savePreferences();g_app.stopRequested=false;g_app.releaseRequested=!g_app.protectedModeSelected;g_app.extraReceiverLock=false;g_app.receiverCount=0;g_app.running=true;transmissionControls(true);refreshStatus();std::scoped_lock lock(g_app.workerMutex);if(g_app.worker.joinable())g_app.worker.join();g_app.worker=std::thread(transmit,target,name,cursor,g_app.protectedModeSelected);}
+
+HFONT makeFont(int px,int weight=FW_NORMAL){return CreateFontW(-px,0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");}
+HWND control(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD style,int x,int y,int w,int h,int id,HFONT font=nullptr){HWND c=CreateWindowExW(0,cls,text,WS_CHILD|WS_VISIBLE|style,x,y,w,h,parent,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);SendMessageW(c,WM_SETFONT,reinterpret_cast<WPARAM>(font?font:g_app.font),TRUE);SetWindowTheme(c,L"DarkMode_Explorer",nullptr);return c;}
+void createControls(HWND w){g_app.font=makeFont(16);g_app.fontSmall=makeFont(14);g_app.fontTitle=makeFont(22,FW_SEMIBOLD);g_app.fontLarge=makeFont(30,FW_SEMIBOLD);g_app.backgroundBrush=CreateSolidBrush(g_app.backgroundColor);g_app.editBrush=CreateSolidBrush(RGB(28,35,46));control(w,L"STATIC",L"Z",SS_CENTER,24,18,42,40,0,g_app.fontLarge);control(w,L"STATIC",L"Transmissor NDI® Portátil",0,78,15,340,28,0,g_app.fontTitle);control(w,L"STATIC",L"por Zosma Labs",0,79,45,180,20,0,g_app.fontSmall);g_app.help=control(w,L"BUTTON",L"Como usar",WS_TABSTOP,823,22,126,36,IdHelp);control(w,L"STATIC",L"TRANSMISSÃO",0,28,92,130,18,0,g_app.fontSmall);g_app.status=control(w,L"STATIC",L"Pronto para iniciar",0,28,116,235,24,IdStatus);control(w,L"STATIC",L"RECEPTORES",0,280,92,130,18,0,g_app.fontSmall);g_app.receivers=control(w,L"STATIC",L"0 conectados",0,280,116,150,24,IdReceivers);control(w,L"STATIC",L"REDE",0,470,92,100,18,0,g_app.fontSmall);g_app.network=control(w,L"STATIC",L"Verificando...",0,470,116,245,24,IdNetwork);control(w,L"STATIC",L"DESEMPENHO",0,730,92,130,18,0,g_app.fontSmall);g_app.performance=control(w,L"STATIC",L"Aguardando · Pronto",0,730,116,220,24,IdPerformance);control(w,L"STATIC",L"Configuração da transmissão",0,34,176,360,27,0,g_app.fontTitle);control(w,L"STATIC",L"Nome da fonte NDI",0,34,216,250,20,0,g_app.fontSmall);std::wstring saved=readString(L"SourceName",L"Tela compartilhada");g_app.sourceName=control(w,L"EDIT",saved.c_str(),WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL,34,240,540,36,IdSourceName);control(w,L"STATIC",L"O que deseja transmitir",0,34,290,250,20,0,g_app.fontSmall);g_app.sourceType=control(w,WC_COMBOBOXW,L"",WS_TABSTOP|CBS_DROPDOWNLIST,34,314,265,180,IdSourceType);SendMessageW(g_app.sourceType,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Monitor inteiro"));SendMessageW(g_app.sourceType,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Janela específica"));SendMessageW(g_app.sourceType,CB_SETCURSEL,readDword(L"CaptureKind",0),0);g_app.captureSource=control(w,WC_COMBOBOXW,L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,309,314,265,220,IdCaptureSource);g_app.cursor=control(w,L"BUTTON",L"Mostrar cursor do mouse",WS_TABSTOP|BS_AUTOCHECKBOX,34,358,250,30,IdCursor);SendMessageW(g_app.cursor,BM_SETCHECK,readDword(L"ShowCursor",1)?BST_CHECKED:BST_UNCHECKED,0);g_app.refresh=control(w,L"BUTTON",L"Atualizar lista",WS_TABSTOP,449,358,125,34,IdRefreshSources);control(w,L"STATIC",L"Modo de transmissão",0,34,414,250,20,0,g_app.fontSmall);g_app.protectedMode=control(w,L"BUTTON",L"Modo protegido — confirmar antes de mostrar",WS_TABSTOP|BS_AUTORADIOBUTTON,34,439,540,32,IdProtectedMode);g_app.fastMode=control(w,L"BUTTON",L"Modo rápido — mostrar imediatamente",WS_TABSTOP|BS_AUTORADIOBUTTON,34,474,540,32,IdFastMode);setMode(readDword(L"ProtectedMode",1)!=0);control(w,L"STATIC",L"Permitir envio durante esta execução",0,34,526,430,25,0,g_app.fontTitle);g_app.allowWhatsapp=control(w,L"BUTTON",L"Permitir envio do WhatsApp",WS_TABSTOP|BS_AUTOCHECKBOX,34,559,270,30,IdAllowWhatsapp);g_app.allowTelegram=control(w,L"BUTTON",L"Permitir envio do Telegram",WS_TABSTOP|BS_AUTOCHECKBOX,310,559,260,30,IdAllowTelegram);g_app.permissionNote=control(w,L"STATIC",L"",0,34,594,540,35,IdPermissionNote,g_app.fontSmall);control(w,L"STATIC",L"Controle de acesso",0,626,176,280,27,0,g_app.fontTitle);control(w,L"STATIC",L"Modo protegido",SS_CENTER,648,231,260,24,0);g_app.accessCount=control(w,L"STATIC",L"0",SS_CENTER,648,266,260,42,0,g_app.fontLarge);g_app.accessMessage=control(w,L"STATIC",L"A fonte enviará uma tela de espera até você liberar o receptor.",SS_CENTER,654,314,248,62,0,g_app.fontSmall);g_app.release=control(w,L"BUTTON",L"Liberar transmissão",WS_TABSTOP|BS_DEFPUSHBUTTON,648,390,260,42,IdRelease);EnableWindow(g_app.release,FALSE);control(w,L"STATIC",L"MODO PRIVACIDADE ATIVO",SS_CENTER,648,465,260,22,0,g_app.fontSmall);control(w,L"STATIC",L"WhatsApp, WhatsApp Business e Telegram serão ocultados automaticamente.",SS_CENTER,650,494,256,65,0,g_app.fontSmall);g_app.website=control(w,L"BUTTON",L"zosma.com.br",WS_TABSTOP,28,654,145,34,IdWebsite);g_app.startStop=control(w,L"BUTTON",L"Iniciar transmissão",WS_TABSTOP|BS_DEFPUSHBUTTON,725,648,224,44,IdStartStop);loadSources();permissionNote();transmissionControls(false);g_app.dontShowHelp=readDword(L"DontShowHelp",0)!=0;}
+void openWebsite(){ShellExecuteW(g_app.window,L"open",kWebsite,nullptr,nullptr,SW_SHOWNORMAL);}
+LRESULT CALLBACK helpProcedure(HWND w,UINT m,WPARAM wp,LPARAM lp){if(m==WM_CREATE){control(w,L"STATIC",L"Como usar",0,24,20,420,30,0,g_app.fontTitle);control(w,L"STATIC",L"1. Escolha um monitor ou uma janela e defina o nome da fonte.\r\n\r\n2. No modo protegido, conecte o receptor e clique em Liberar transmissão.\r\n\r\n3. Se uma segunda conexão aparecer, a imagem será bloqueada para todos.\r\n\r\n4. WhatsApp, WhatsApp Business e Telegram são protegidos por padrão. As permissões valem somente durante esta execução.\r\n\r\n5. As notificações do Windows não são ocultadas. Ative o modo Não incomodar antes de apresentar.",0,24,65,500,255,0,g_app.font);control(w,L"STATIC",L"Transmissor NDI® Portátil · por Zosma Labs",0,24,335,380,22,0,g_app.fontSmall);control(w,L"BUTTON",L"Visitar zosma.com.br",WS_TABSTOP,24,370,180,34,IdWebsite);HWND c=control(w,L"BUTTON",L"Não abrir automaticamente nas próximas vezes",WS_TABSTOP|BS_AUTOCHECKBOX,24,420,400,30,IdDontShowHelp);SendMessageW(c,BM_SETCHECK,g_app.dontShowHelp?BST_CHECKED:BST_UNCHECKED,0);return 0;}if(m==WM_COMMAND){if(LOWORD(wp)==IdWebsite){openWebsite();return 0;}if(LOWORD(wp)==IdDontShowHelp){g_app.dontShowHelp=SendMessageW(GetDlgItem(w,IdDontShowHelp),BM_GETCHECK,0,0)==BST_CHECKED;writeDword(L"DontShowHelp",g_app.dontShowHelp?1:0);return 0;}}if(m==WM_CTLCOLORSTATIC){SetBkMode(reinterpret_cast<HDC>(wp),TRANSPARENT);SetTextColor(reinterpret_cast<HDC>(wp),g_app.textColor);return reinterpret_cast<LRESULT>(g_app.backgroundBrush);}if(m==WM_ERASEBKGND){RECT r{};GetClientRect(w,&r);FillRect(reinterpret_cast<HDC>(wp),&r,g_app.backgroundBrush);return 1;}if(m==WM_CLOSE){DestroyWindow(w);return 0;}if(m==WM_DESTROY){g_app.helpWindow=nullptr;return 0;}return DefWindowProcW(w,m,wp,lp);}
+void showHelp(){if(g_app.helpWindow){ShowWindow(g_app.helpWindow,SW_RESTORE);SetForegroundWindow(g_app.helpWindow);return;}g_app.helpWindow=CreateWindowExW(WS_EX_DLGMODALFRAME,kHelpClass,L"Como usar — Transmissor NDI® Portátil",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,570,520,g_app.window,nullptr,GetModuleHandleW(nullptr),nullptr);ShowWindow(g_app.helpWindow,SW_SHOW);}
+LRESULT CALLBACK mainProcedure(HWND w,UINT m,WPARAM wp,LPARAM lp){switch(m){case WM_CREATE:g_app.window=w;createControls(w);SetTimer(w,kUiTimer,1000,nullptr);logLine(L"Aplicativo iniciado.");if(!g_app.dontShowHelp)PostMessageW(w,WM_COMMAND,IdHelp,0);return 0;case WM_COMMAND:switch(LOWORD(wp)){case IdStartStop:if(g_app.running)stopTransmission();else startTransmission();return 0;case IdRelease:if(g_app.receiverCount==1){g_app.extraReceiverLock=false;g_app.releaseRequested=true;logLine(L"Transmissão liberada manualmente.");refreshStatus();}return 0;case IdRefreshSources:loadSources();return 0;case IdSourceType:if(HIWORD(wp)==CBN_SELCHANGE)loadSources();return 0;case IdProtectedMode:setMode(true);return 0;case IdFastMode:setMode(false);return 0;case IdAllowWhatsapp:case IdAllowTelegram:permissionNote();return 0;case IdHelp:showHelp();return 0;case IdWebsite:openWebsite();return 0;}break;case WM_TIMER:updateNetwork();refreshStatus();return 0;case kWorkerUpdate:refreshStatus();return 0;case kWorkerFinished:g_app.running=false;g_app.receiverCount=0;g_app.measuredFps=0;g_app.privacyReason=PrivacyReason::None;transmissionControls(false);refreshStatus();if(wp)MessageBoxW(w,L"Não foi possível iniciar o NDI. Verifique a DLL na pasta e consulte o log.",L"Transmissor NDI® Portátil",MB_ICONERROR);return 0;case WM_CTLCOLORSTATIC:SetBkMode(reinterpret_cast<HDC>(wp),TRANSPARENT);SetTextColor(reinterpret_cast<HDC>(wp),g_app.textColor);return reinterpret_cast<LRESULT>(g_app.backgroundBrush);case WM_CTLCOLOREDIT:SetBkColor(reinterpret_cast<HDC>(wp),RGB(28,35,46));SetTextColor(reinterpret_cast<HDC>(wp),g_app.textColor);return reinterpret_cast<LRESULT>(g_app.editBrush);case WM_ERASEBKGND:{RECT r{};GetClientRect(w,&r);FillRect(reinterpret_cast<HDC>(wp),&r,g_app.backgroundBrush);return 1;}case WM_DISPLAYCHANGE:if(!g_app.running&&selectedKind()==CaptureKind::Monitor)loadSources();return 0;case WM_CLOSE:if(g_app.running&&MessageBoxW(w,L"A transmissão está ativa. Deseja realmente parar e sair?",L"Transmissor NDI® Portátil",MB_YESNO|MB_ICONQUESTION)!=IDYES)return 0;stopTransmission();savePreferences();DestroyWindow(w);return 0;case WM_DESTROY:KillTimer(w,kUiTimer);for(HFONT f:{g_app.font,g_app.fontSmall,g_app.fontTitle,g_app.fontLarge})if(f)DeleteObject(f);for(HBRUSH b:{g_app.backgroundBrush,g_app.editBrush})if(b)DeleteObject(b);PostQuitMessage(0);return 0;}return DefWindowProcW(w,m,wp,lp);}
 }
 
-BOOL CALLBACK enumerateMonitor(HMONITOR monitor, HDC, LPRECT bounds, LPARAM data) {
-    auto* monitors = reinterpret_cast<std::vector<MonitorInfo>*>(data);
-    MONITORINFOEXW info{};
-    info.cbSize = sizeof(info);
-    GetMonitorInfoW(monitor, &info);
-
-    const int number = static_cast<int>(monitors->size()) + 1;
-    const int width = bounds->right - bounds->left;
-    const int height = bounds->bottom - bounds->top;
-    std::wstring label = L"Monitor " + std::to_wstring(number) + L" — " +
-                         std::to_wstring(width) + L" × " + std::to_wstring(height);
-    if ((info.dwFlags & MONITORINFOF_PRIMARY) != 0) label += L" (principal)";
-    monitors->push_back({monitor, *bounds, std::move(label)});
-    return TRUE;
-}
-
-void enumerateMonitors() {
-    g_app.monitors.clear();
-    EnumDisplayMonitors(nullptr, nullptr, enumerateMonitor,
-                        reinterpret_cast<LPARAM>(&g_app.monitors));
-}
-
-BOOL CALLBACK enumerateWindow(HWND window, LPARAM data) {
-    if (window == g_app.window || !IsWindowVisible(window) || IsIconic(window)) return TRUE;
-    const int titleLength = GetWindowTextLengthW(window);
-    if (titleLength <= 0) return TRUE;
-
-    std::wstring title(static_cast<size_t>(titleLength) + 1, L'\0');
-    GetWindowTextW(window, title.data(), titleLength + 1);
-    title.resize(static_cast<size_t>(titleLength));
-
-    RECT bounds{};
-    if (!GetWindowRect(window, &bounds) || bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
-        return TRUE;
-    }
-
-    auto* windows = reinterpret_cast<std::vector<WindowInfo>*>(data);
-    windows->push_back({window, bounds, std::move(title)});
-    return TRUE;
-}
-
-void enumerateWindows() {
-    g_app.windows.clear();
-    EnumWindows(enumerateWindow, reinterpret_cast<LPARAM>(&g_app.windows));
-}
-
-CaptureKind selectedCaptureKind() {
-    return SendMessageW(g_app.sourceTypeCombo, CB_GETCURSEL, 0, 0) == 1
-        ? CaptureKind::Window
-        : CaptureKind::Monitor;
-}
-
-void loadCaptureSources() {
-    const CaptureKind kind = selectedCaptureKind();
-    SendMessageW(g_app.captureSourceCombo, CB_RESETCONTENT, 0, 0);
-
-    if (kind == CaptureKind::Monitor) {
-        enumerateMonitors();
-        for (const auto& monitor : g_app.monitors) {
-            SendMessageW(g_app.captureSourceCombo, CB_ADDSTRING, 0,
-                         reinterpret_cast<LPARAM>(monitor.label.c_str()));
-        }
-    } else {
-        enumerateWindows();
-        for (const auto& window : g_app.windows) {
-            SendMessageW(g_app.captureSourceCombo, CB_ADDSTRING, 0,
-                         reinterpret_cast<LPARAM>(window.label.c_str()));
-        }
-    }
-
-    const LRESULT count = SendMessageW(g_app.captureSourceCombo, CB_GETCOUNT, 0, 0);
-    if (count > 0) SendMessageW(g_app.captureSourceCombo, CB_SETCURSEL, 0, 0);
-}
-
-void drawCursorInto(HDC target, const RECT& monitorBounds) {
-    CURSORINFO cursor{};
-    cursor.cbSize = sizeof(cursor);
-    if (!GetCursorInfo(&cursor) || cursor.flags != CURSOR_SHOWING) return;
-    if (!PtInRect(&monitorBounds, cursor.ptScreenPos)) return;
-
-    ICONINFO icon{};
-    int x = cursor.ptScreenPos.x - monitorBounds.left;
-    int y = cursor.ptScreenPos.y - monitorBounds.top;
-    if (GetIconInfo(cursor.hCursor, &icon)) {
-        x -= static_cast<int>(icon.xHotspot);
-        y -= static_cast<int>(icon.yHotspot);
-        if (icon.hbmMask) DeleteObject(icon.hbmMask);
-        if (icon.hbmColor) DeleteObject(icon.hbmColor);
-    }
-    DrawIconEx(target, x, y, cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
-}
-
-using NdiLoadFunction = const NDIlib_v6* (*)();
-
-void transmitMonitor(MonitorInfo monitor, std::string sourceName, bool showCursor) {
-    const auto dllPath = executableDirectory() / L"Processing.NDI.Lib.x64.dll";
-    HMODULE ndiModule = LoadLibraryW(dllPath.c_str());
-    if (!ndiModule) {
-        postStatus(L"Erro: biblioteca NDI ausente ou bloqueada. Consulte o log.");
-        g_app.running = false;
-        return;
-    }
-
-    auto loadNdi = reinterpret_cast<NdiLoadFunction>(GetProcAddress(ndiModule, "NDIlib_v6_load"));
-    const NDIlib_v6* ndi = loadNdi ? loadNdi() : nullptr;
-    if (!ndi || !ndi->initialize()) {
-        postStatus(L"Erro: não foi possível inicializar o NDI.");
-        FreeLibrary(ndiModule);
-        g_app.running = false;
-        return;
-    }
-
-    NDIlib_send_create_t create{};
-    create.p_ndi_name = sourceName.c_str();
-    create.clock_video = true;
-    create.clock_audio = false;
-    NDIlib_send_instance_t sender = ndi->send_create(&create);
-    if (!sender) {
-        postStatus(L"Erro: o NDI não conseguiu criar a transmissão.");
-        ndi->destroy();
-        FreeLibrary(ndiModule);
-        g_app.running = false;
-        return;
-    }
-
-    const int width = monitor.bounds.right - monitor.bounds.left;
-    const int height = monitor.bounds.bottom - monitor.bounds.top;
-    HDC screenDc = GetDC(nullptr);
-    HDC memoryDc = CreateCompatibleDC(screenDc);
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmapInfo.bmiHeader.biWidth = width;
-    bitmapInfo.bmiHeader.biHeight = -height;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    HGDIOBJ previous = bitmap ? SelectObject(memoryDc, bitmap) : nullptr;
-
-    if (!screenDc || !memoryDc || !bitmap || !pixels) {
-        postStatus(L"Erro: não foi possível preparar a captura da tela.");
-    } else {
-        NDIlib_video_frame_v2_t frame{};
-        frame.xres = width;
-        frame.yres = height;
-        frame.FourCC = NDIlib_FourCC_video_type_BGRX;
-        frame.frame_rate_N = 30000;
-        frame.frame_rate_D = 1000;
-        frame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-        frame.frame_format_type = NDIlib_frame_format_type_progressive;
-        frame.timecode = NDIlib_send_timecode_synthesize;
-        frame.p_data = static_cast<uint8_t*>(pixels);
-        frame.line_stride_in_bytes = width * 4;
-
-        postStatus(L"Transmitindo monitor via NDI — 30 FPS");
-        while (!g_app.stopRequested.load()) {
-            if (!BitBlt(memoryDc, 0, 0, width, height, screenDc,
-                        monitor.bounds.left, monitor.bounds.top, SRCCOPY | CAPTUREBLT)) {
-                postStatus(L"Erro durante a captura da tela.");
-                break;
-            }
-            if (showCursor) drawCursorInto(memoryDc, monitor.bounds);
-            ndi->send_send_video_v2(sender, &frame);
-        }
-    }
-
-    if (previous) SelectObject(memoryDc, previous);
-    if (bitmap) DeleteObject(bitmap);
-    if (memoryDc) DeleteDC(memoryDc);
-    if (screenDc) ReleaseDC(nullptr, screenDc);
-    ndi->send_destroy(sender);
-    ndi->destroy();
-    FreeLibrary(ndiModule);
-    g_app.running = false;
-    postStatus(L"Transmissão encerrada.");
-}
-
-void transmitWindow(CaptureTarget target, std::string sourceName, bool showCursor) {
-    const auto dllPath = executableDirectory() / L"Processing.NDI.Lib.x64.dll";
-    HMODULE ndiModule = LoadLibraryW(dllPath.c_str());
-    if (!ndiModule) {
-        postStatus(L"Erro: biblioteca NDI ausente ou bloqueada. Consulte o log.");
-        g_app.running = false;
-        return;
-    }
-
-    auto loadNdi = reinterpret_cast<NdiLoadFunction>(GetProcAddress(ndiModule, "NDIlib_v6_load"));
-    const NDIlib_v6* ndi = loadNdi ? loadNdi() : nullptr;
-    if (!ndi || !ndi->initialize()) {
-        postStatus(L"Erro: não foi possível inicializar o NDI.");
-        FreeLibrary(ndiModule);
-        g_app.running = false;
-        return;
-    }
-
-    NDIlib_send_create_t create{};
-    create.p_ndi_name = sourceName.c_str();
-    create.clock_video = true;
-    create.clock_audio = false;
-    NDIlib_send_instance_t sender = ndi->send_create(&create);
-    if (!sender) {
-        postStatus(L"Erro: o NDI não conseguiu criar a transmissão.");
-        ndi->destroy();
-        FreeLibrary(ndiModule);
-        g_app.running = false;
-        return;
-    }
-
-    if (target.kind == CaptureKind::Window) {
-        if (!IsWindow(target.window) || IsIconic(target.window) || !GetWindowRect(target.window, &target.bounds)) {
-            postStatus(L"Erro: a janela escolhida não está disponível.");
-            ndi->send_destroy(sender);
-            ndi->destroy();
-            FreeLibrary(ndiModule);
-            g_app.running = false;
-            return;
-        }
-    }
-
-    HDC screenDc = GetDC(nullptr);
-    HDC memoryDc = CreateCompatibleDC(screenDc);
-    HBITMAP bitmap = nullptr;
-    HGDIOBJ originalBitmap = nullptr;
-    void* pixels = nullptr;
-    int width = 0;
-    int height = 0;
-    NDIlib_video_frame_v2_t frame{};
-
-    const auto resizeCaptureSurface = [&](const RECT& bounds) -> bool {
-        const int newWidth = bounds.right - bounds.left;
-        const int newHeight = bounds.bottom - bounds.top;
-        if (newWidth <= 0 || newHeight <= 0) return false;
-        if (bitmap && newWidth == width && newHeight == height) return true;
-
-        if (bitmap) {
-            SelectObject(memoryDc, originalBitmap);
-            DeleteObject(bitmap);
-            bitmap = nullptr;
-            pixels = nullptr;
-        }
-
-        BITMAPINFO bitmapInfo{};
-        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bitmapInfo.bmiHeader.biWidth = newWidth;
-        bitmapInfo.bmiHeader.biHeight = -newHeight;
-        bitmapInfo.bmiHeader.biPlanes = 1;
-        bitmapInfo.bmiHeader.biBitCount = 32;
-        bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-        bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
-        if (!bitmap || !pixels) return false;
-        HGDIOBJ replaced = SelectObject(memoryDc, bitmap);
-        if (!originalBitmap) originalBitmap = replaced;
-
-        width = newWidth;
-        height = newHeight;
-        frame = {};
-        frame.xres = width;
-        frame.yres = height;
-        frame.FourCC = NDIlib_FourCC_video_type_BGRX;
-        frame.frame_rate_N = 30000;
-        frame.frame_rate_D = 1000;
-        frame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-        frame.frame_format_type = NDIlib_frame_format_type_progressive;
-        frame.timecode = NDIlib_send_timecode_synthesize;
-        frame.p_data = static_cast<uint8_t*>(pixels);
-        frame.line_stride_in_bytes = width * 4;
-        return true;
-    };
-
-    if (!screenDc || !memoryDc || !resizeCaptureSurface(target.bounds)) {
-        postStatus(L"Erro: não foi possível preparar a captura da tela.");
-    } else {
-        postStatus(L"Transmitindo janela via NDI — 30 FPS");
-        while (!g_app.stopRequested.load()) {
-            RECT currentBounds = target.bounds;
-            if (!IsWindow(target.window)) {
-                postStatus(L"A janela selecionada foi fechada. Transmissão encerrada por segurança.");
-                break;
-            }
-            if (IsIconic(target.window)) {
-                postStatus(L"A janela foi minimizada. Restaure-a para continuar transmitindo.");
-                break;
-            }
-            if (!GetWindowRect(target.window, &currentBounds)) {
-                postStatus(L"Não foi possível acompanhar a janela selecionada.");
-                break;
-            }
-            if (!resizeCaptureSurface(currentBounds)) {
-                postStatus(L"Não foi possível ajustar a captura ao novo tamanho da janela.");
-                break;
-            }
-
-            bool captured = PrintWindow(target.window, memoryDc, 0x00000002) != FALSE;
-            if (!captured) {
-                captured = BitBlt(memoryDc, 0, 0, width, height, screenDc,
-                                  currentBounds.left, currentBounds.top, SRCCOPY | CAPTUREBLT) != FALSE;
-            }
-
-            if (!captured) {
-                postStatus(L"Erro durante a captura da tela.");
-                break;
-            }
-            if (showCursor) drawCursorInto(memoryDc, currentBounds);
-            ndi->send_send_video_v2(sender, &frame);
-        }
-    }
-
-    if (originalBitmap) SelectObject(memoryDc, originalBitmap);
-    if (bitmap) DeleteObject(bitmap);
-    if (memoryDc) DeleteDC(memoryDc);
-    if (screenDc) ReleaseDC(nullptr, screenDc);
-    ndi->send_destroy(sender);
-    ndi->destroy();
-    FreeLibrary(ndiModule);
-    g_app.running = false;
-    postStatus(L"Transmissão encerrada.");
-}
-
-void setControlsForTransmission(bool transmitting) {
-    EnableWindow(g_app.sourceName, !transmitting);
-    EnableWindow(g_app.sourceTypeCombo, !transmitting);
-    EnableWindow(g_app.captureSourceCombo, !transmitting);
-    EnableWindow(g_app.refreshButton, !transmitting);
-    EnableWindow(g_app.cursorCheckbox, !transmitting);
-    EnableWindow(g_app.startButton, !transmitting);
-    EnableWindow(g_app.stopButton, transmitting);
-}
-
-void stopTransmission() {
-    g_app.stopRequested = true;
-    std::scoped_lock lock(g_app.workerMutex);
-    if (g_app.worker.joinable()) g_app.worker.join();
-    setControlsForTransmission(false);
-}
-
-void startTransmission() {
-    if (g_app.running.load()) return;
-    const int sourceIndex = static_cast<int>(SendMessageW(g_app.captureSourceCombo, CB_GETCURSEL, 0, 0));
-    const CaptureKind kind = selectedCaptureKind();
-    CaptureTarget target{};
-    target.kind = kind;
-
-    if (kind == CaptureKind::Monitor) {
-        if (sourceIndex < 0 || sourceIndex >= static_cast<int>(g_app.monitors.size())) {
-            MessageBoxW(g_app.window, L"Nenhum monitor foi encontrado.", L"Transmissor NDI", MB_ICONWARNING);
-            return;
-        }
-        target.bounds = g_app.monitors[sourceIndex].bounds;
-        target.label = g_app.monitors[sourceIndex].label;
-    } else {
-        if (sourceIndex < 0 || sourceIndex >= static_cast<int>(g_app.windows.size())) {
-            MessageBoxW(g_app.window, L"Nenhuma janela foi selecionada. Clique em Atualizar lista.",
-                        L"Transmissor NDI", MB_ICONWARNING);
-            return;
-        }
-        target.window = g_app.windows[sourceIndex].handle;
-        target.bounds = g_app.windows[sourceIndex].bounds;
-        target.label = g_app.windows[sourceIndex].label;
-    }
-
-    if (target.bounds.right <= target.bounds.left || target.bounds.bottom <= target.bounds.top) {
-        MessageBoxW(g_app.window, L"A origem selecionada possui tamanho inválido.",
-                    L"Transmissor NDI", MB_ICONWARNING);
-        return;
-    }
-
-    wchar_t nameBuffer[256]{};
-    GetWindowTextW(g_app.sourceName, nameBuffer, static_cast<int>(std::size(nameBuffer)));
-    std::wstring wideName(nameBuffer);
-    if (wideName.empty()) wideName = L"Tela compartilhada";
-
-    const bool showCursor = SendMessageW(g_app.cursorCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g_app.stopRequested = false;
-    g_app.running = true;
-    setControlsForTransmission(true);
-    postStatus(L"Iniciando transmissão…");
-
-    std::scoped_lock lock(g_app.workerMutex);
-    if (g_app.worker.joinable()) g_app.worker.join();
-    if (kind == CaptureKind::Monitor) {
-        g_app.worker = std::thread(transmitMonitor, g_app.monitors[sourceIndex],
-                                   utf8(wideName), showCursor);
-    } else {
-        g_app.worker = std::thread(transmitWindow, target, utf8(wideName), showCursor);
-    }
-}
-
-HFONT createUiFont() {
-    NONCLIENTMETRICSW metrics{};
-    metrics.cbSize = sizeof(metrics);
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
-    return CreateFontIndirectW(&metrics.lfMessageFont);
-}
-
-void createControls(HWND window) {
-    const auto create = [window](const wchar_t* cls, const wchar_t* text, DWORD style,
-                                 int x, int y, int width, int height, int id) {
-        return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                               x, y, width, height, window,
-                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                               GetModuleHandleW(nullptr), nullptr);
-    };
-
-    create(L"STATIC", L"Nome da transmissão", 0, 24, 22, 470, 22, 0);
-    g_app.sourceName = create(L"EDIT", L"Tela compartilhada", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-                              24, 47, 470, 30, IdSourceName);
-    create(L"STATIC", L"O que deseja transmitir?", 0, 24, 92, 470, 22, 0);
-    g_app.sourceTypeCombo = create(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST,
-                                   24, 117, 470, 100, IdSourceType);
-    SendMessageW(g_app.sourceTypeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Monitor inteiro"));
-    SendMessageW(g_app.sourceTypeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Janela específica"));
-    SendMessageW(g_app.sourceTypeCombo, CB_SETCURSEL, 0, 0);
-
-    create(L"STATIC", L"Monitor ou janela", 0, 24, 158, 470, 22, 0);
-    g_app.captureSourceCombo = create(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      24, 183, 350, 220, IdCaptureSource);
-    g_app.refreshButton = create(L"BUTTON", L"Atualizar lista", WS_TABSTOP,
-                                 386, 182, 108, 31, IdRefreshSources);
-    g_app.cursorCheckbox = create(L"BUTTON", L"Mostrar cursor do mouse",
-                                  WS_TABSTOP | BS_AUTOCHECKBOX, 24, 225, 260, 28, IdCursor);
-    SendMessageW(g_app.cursorCheckbox, BM_SETCHECK, BST_CHECKED, 0);
-    g_app.startButton = create(L"BUTTON", L"Iniciar transmissão", WS_TABSTOP | BS_DEFPUSHBUTTON,
-                               24, 272, 226, 42, IdStart);
-    g_app.stopButton = create(L"BUTTON", L"Parar", WS_TABSTOP,
-                              268, 272, 226, 42, IdStop);
-    g_app.statusLabel = create(L"STATIC", L"Pronto para transmitir.", SS_LEFT,
-                               24, 334, 470, 42, IdStatus);
-
-    HFONT font = createUiFont();
-    EnumChildWindows(window, [](HWND child, LPARAM fontHandle) -> BOOL {
-        SendMessageW(child, WM_SETFONT, fontHandle, TRUE);
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(font));
-    SetPropW(window, L"UiFont", font);
-
-    loadCaptureSources();
-    setControlsForTransmission(false);
-}
-
-LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-        case WM_CREATE:
-            g_app.window = window;
-            createControls(window);
-            logLine(L"Aplicativo iniciado.");
-            return 0;
-        case WM_COMMAND:
-            switch (LOWORD(wParam)) {
-                case IdStart: startTransmission(); return 0;
-                case IdStop: stopTransmission(); return 0;
-                case IdRefreshSources: loadCaptureSources(); return 0;
-                case IdSourceType:
-                    if (HIWORD(wParam) == CBN_SELCHANGE) loadCaptureSources();
-                    return 0;
-                default: break;
-            }
-            break;
-        case WM_DISPLAYCHANGE:
-            if (!g_app.running.load() && selectedCaptureKind() == CaptureKind::Monitor) {
-                loadCaptureSources();
-            }
-            return 0;
-        case kStatusMessage: {
-            auto* status = reinterpret_cast<std::wstring*>(lParam);
-            SetWindowTextW(g_app.statusLabel, status->c_str());
-            if (!g_app.running.load()) setControlsForTransmission(false);
-            delete status;
-            return 0;
-        }
-        case WM_CLOSE:
-            stopTransmission();
-            DestroyWindow(window);
-            return 0;
-        case WM_DESTROY: {
-            if (auto font = reinterpret_cast<HFONT>(GetPropW(window, L"UiFont"))) {
-                DeleteObject(font);
-                RemovePropW(window, L"UiFont");
-            }
-            PostQuitMessage(0);
-            return 0;
-        }
-        default: break;
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
-}
-
-} // namespace
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
-    InitCommonControlsEx(&controls);
-
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = windowProcedure;
-    windowClass.hInstance = instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    windowClass.lpszClassName = kWindowClass;
-    if (!RegisterClassExW(&windowClass)) return 1;
-
-    HWND window = CreateWindowExW(0, kWindowClass, L"Transmissor NDI Portátil — Protótipo",
-                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 540, 430,
-                                  nullptr, nullptr, instance, nullptr);
-    if (!window) return 1;
-
-    ShowWindow(window, showCommand);
-    UpdateWindow(window);
-
-    MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
-    return static_cast<int>(message.wParam);
-}
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show){SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_STANDARD_CLASSES};InitCommonControlsEx(&cc);WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.lpfnWndProc=mainProcedure;wc.hInstance=instance;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(1));wc.hIconSm=wc.hIcon;wc.lpszClassName=kWindowClass;if(!RegisterClassExW(&wc))return 1;WNDCLASSEXW hc=wc;hc.lpfnWndProc=helpProcedure;hc.lpszClassName=kHelpClass;if(!RegisterClassExW(&hc))return 1;HWND w=CreateWindowExW(0,kWindowClass,L"Transmissor NDI® Portátil — Zosma Labs",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,994,748,nullptr,nullptr,instance,nullptr);if(!w)return 1;BOOL dark=TRUE;DwmSetWindowAttribute(w,20,&dark,sizeof(dark));ShowWindow(w,show);UpdateWindow(w);MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
