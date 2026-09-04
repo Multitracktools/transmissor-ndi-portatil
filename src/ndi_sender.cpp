@@ -1,4 +1,5 @@
 #include "ndi_sender.h"
+#include "ip_filter.h"
 #include <windows.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -15,6 +17,8 @@
 namespace {
 using NdiLoadFunction = const NDIlib_v6* (*)();
 using namespace std::chrono_literals;
+
+std::string gTrustedIp;
 
 std::filesystem::path executableDirectory() {
     std::vector<wchar_t> buffer(32768);
@@ -28,6 +32,35 @@ std::string ipv4ToString(DWORD address) {
     char text[INET_ADDRSTRLEN]{};
     if (!InetNtopA(AF_INET, &addr, text, static_cast<DWORD>(sizeof(text)))) return "?";
     return text;
+}
+
+std::set<std::string> establishedRemoteIps() {
+    std::set<std::string> ips;
+    ULONG bytes = 0;
+    DWORD result = GetExtendedTcpTable(nullptr, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (result != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return ips;
+    std::vector<unsigned char> storage(bytes);
+    auto* table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(storage.data());
+    result = GetExtendedTcpTable(table, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (result != NO_ERROR) return ips;
+
+    const DWORD pid = GetCurrentProcessId();
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        if (row.dwOwningPid != pid || row.dwState != MIB_TCP_STATE_ESTAB) continue;
+        const std::string ip = ipv4ToString(row.dwRemoteAddr);
+        if (!ip.empty() && ip != "?" && ip != "0.0.0.0" && ip != "127.0.0.1") ips.insert(ip);
+    }
+    return ips;
+}
+
+void tryLockToFirstReceiver() {
+    if (!gTrustedIp.empty()) return;
+    const auto ips = establishedRemoteIps();
+    if (ips.size() != 1) return;
+    gTrustedIp = *ips.begin();
+    std::wstring error;
+    if (!installReceiverIpFilter(gTrustedIp, error)) gTrustedIp.clear();
 }
 
 std::string tcpStateName(DWORD state) {
@@ -56,6 +89,8 @@ void logRemoteEndpoints(int ndiConnections) {
     if (now - lastScan < 1s) return;
     lastScan = now;
 
+    tryLockToFirstReceiver();
+
     ULONG bytes = 0;
     DWORD result = GetExtendedTcpTable(nullptr, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
     if (result != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return;
@@ -68,6 +103,8 @@ void logRemoteEndpoints(int ndiConnections) {
     const DWORD pid = GetCurrentProcessId();
     std::ostringstream snapshot;
     snapshot << "NDI technical connections: " << ndiConnections << "\n";
+    snapshot << "Experimental trusted IP: " << (gTrustedIp.empty() ? "(waiting for exactly one receiver)" : gTrustedIp) << "\n";
+    snapshot << "Selective IP filter: " << (receiverIpFilterActive() ? "ACTIVE" : "inactive") << "\n";
 
     int ownedRows = 0;
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
@@ -113,6 +150,7 @@ NdiSender::~NdiSender() { close(); }
 
 bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string& sourceName, std::wstring& error) {
     close();
+    gTrustedIp.clear();
     HMODULE module = LoadLibraryW(runtimeDll.c_str());
     if (!module) { error = L"Não foi possível carregar Processing.NDI.Lib.x64.dll."; return false; }
     auto load = reinterpret_cast<NdiLoadFunction>(GetProcAddress(module, "NDIlib_v6_load"));
@@ -140,6 +178,8 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
 }
 
 void NdiSender::close() {
+    removeReceiverIpFilter();
+    gTrustedIp.clear();
     auto* api = static_cast<const NDIlib_v6*>(api_);
     if (api && sender_) api->send_destroy(static_cast<NDIlib_send_instance_t>(sender_));
     if (api) api->destroy();
