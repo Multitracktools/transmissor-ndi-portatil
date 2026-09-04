@@ -10,7 +10,8 @@ public:
     NdiSender(const NdiSender&) = delete;
     NdiSender& operator=(const NdiSender&) = delete;
 
-    bool open(const std::filesystem::path& runtimeDll, const std::string& sourceName, std::wstring& error);
+    bool open(const std::filesystem::path& runtimeDll, const std::string& sourceName,
+              const std::string& trustedIpv4, std::wstring& error);
     void close();
     bool sendFrame(const std::uint8_t* data, int width, int height, int fps);
     int connections() const;
