@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@ using namespace std::chrono_literals;
 constexpr wchar_t kWindowClass[] = L"TransmissorNDIPortatilV3";
 constexpr UINT kStatusMessage = WM_APP + 1;
 constexpr UINT kWorkerEnded = WM_APP + 2;
+constexpr UINT kReceiverMessage = WM_APP + 3;
 
 enum ControlId {
     IdSourceName = 1001,
@@ -32,7 +34,9 @@ enum ControlId {
     IdProtected,
     IdQuick,
     IdStart,
+    IdRelease,
     IdStop,
+    IdReceivers,
     IdStatus,
     IdHelp
 };
@@ -48,13 +52,18 @@ struct UiState {
     HWND protectedMode{};
     HWND quickMode{};
     HWND start{};
+    HWND release{};
     HWND stop{};
+    HWND receivers{};
     HWND status{};
     HWND help{};
     std::vector<MonitorSource> monitors;
     std::vector<WindowSource> windows;
     std::atomic_bool running{false};
     std::atomic_bool stopRequested{false};
+    std::atomic_bool authorized{false};
+    std::atomic_int receiverCount{0};
+    bool activeProtectedMode{true};
     std::thread worker;
     std::mutex workerMutex;
     AppSettings settings;
@@ -97,6 +106,10 @@ void setChecked(HWND hwnd, bool checked) {
 void postStatus(const std::wstring& text) {
     auto* copy = new std::wstring(text);
     if (!PostMessageW(g.window, kStatusMessage, 0, reinterpret_cast<LPARAM>(copy))) delete copy;
+}
+
+void postReceiverCount(int count) {
+    PostMessageW(g.window, kReceiverMessage, static_cast<WPARAM>(count), 0);
 }
 
 CaptureKind selectedKind() {
@@ -162,9 +175,83 @@ void updateControls() {
     EnableWindow(g.cursor, !running);
     EnableWindow(g.protectedMode, !running);
     EnableWindow(g.quickMode, !running);
+
+    const bool canRelease = running && g.activeProtectedMode && g.receiverCount.load() == 1 && !g.authorized.load();
+    EnableWindow(g.release, canRelease);
 }
 
-void transmissionWorker(CaptureSource source, std::string sourceName, int fps, bool showCursor) {
+std::vector<unsigned char> createMessageFrame(int width, int height,
+                                               const std::wstring& title,
+                                               const std::wstring& body,
+                                               const std::wstring& sourceName) {
+    std::vector<unsigned char> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* dibPixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
+    if (!bitmap || !dibPixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+        if (screen) ReleaseDC(nullptr, screen);
+        return pixels;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    RECT full{0, 0, width, height};
+    HBRUSH background = CreateSolidBrush(RGB(18, 20, 24));
+    FillRect(dc, &full, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+
+    LOGFONTW lf{};
+    wcscpy_s(lf.lfFaceName, L"Segoe UI");
+    lf.lfHeight = -38;
+    lf.lfWeight = FW_SEMIBOLD;
+    HFONT titleFont = CreateFontIndirectW(&lf);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dc, titleFont));
+    SetTextColor(dc, RGB(245, 246, 248));
+    RECT r{40, height / 2 - 100, width - 40, height / 2 - 20};
+    DrawTextW(dc, title.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    lf.lfHeight = -22;
+    lf.lfWeight = FW_NORMAL;
+    HFONT bodyFont = CreateFontIndirectW(&lf);
+    SelectObject(dc, bodyFont);
+    SetTextColor(dc, RGB(190, 196, 205));
+    r = {40, height / 2 - 20, width - 40, height / 2 + 60};
+    DrawTextW(dc, body.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    lf.lfHeight = -16;
+    HFONT sourceFont = CreateFontIndirectW(&lf);
+    SelectObject(dc, sourceFont);
+    SetTextColor(dc, RGB(130, 137, 147));
+    r = {40, height - 70, width - 40, height - 25};
+    DrawTextW(dc, sourceName.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    std::memcpy(pixels.data(), dibPixels, pixels.size());
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+    DeleteObject(sourceFont);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return pixels;
+}
+
+void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
+                        std::string sourceName, int fps, bool showCursor,
+                        TransmissionMode mode) {
     NdiSender sender;
     std::wstring error;
     if (!sender.open(executableDirectory() / L"Processing.NDI.Lib.x64.dll", sourceName, error)) {
@@ -174,21 +261,74 @@ void transmissionWorker(CaptureSource source, std::string sourceName, int fps, b
         return;
     }
 
-    postStatus(L"Fonte NDI ativa. Base V3 em teste.");
+    const int placeholderWidth = 1280;
+    const int placeholderHeight = 720;
+    const auto waitingFrame = createMessageFrame(
+        placeholderWidth, placeholderHeight,
+        L"Transmissão protegida",
+        L"Aguardando autorização no computador transmissor.",
+        sourceDisplayName);
+    const auto extraConnectionFrame = createMessageFrame(
+        placeholderWidth, placeholderHeight,
+        L"Transmissão temporariamente bloqueada",
+        L"Foi detectada uma conexão adicional.",
+        sourceDisplayName);
+
+    g.authorized = (mode == TransmissionMode::Quick);
+    g.receiverCount = 0;
+    postReceiverCount(0);
+    postStatus(mode == TransmissionMode::Protected
+        ? L"Fonte NDI ativa — aguardando receptor."
+        : L"Modo rápido — transmissão iniciada.");
+
     std::vector<unsigned char> frame;
     int width = 0;
     int height = 0;
+    int previousConnections = -1;
+    bool extraConnectionLock = false;
     auto nextFrame = std::chrono::steady_clock::now();
 
     while (!g.stopRequested.load()) {
-        if (!captureToBuffer(source, showCursor, frame, width, height)) {
-            postStatus(L"Falha de captura. A transmissão foi encerrada.");
-            break;
+        const int connections = sender.connections();
+        if (connections != previousConnections) {
+            previousConnections = connections;
+            g.receiverCount = connections;
+            postReceiverCount(connections);
+
+            if (mode == TransmissionMode::Protected) {
+                if (connections > 1) {
+                    extraConnectionLock = true;
+                    g.authorized = false;
+                    postStatus(L"Transmissão bloqueada — foi detectado mais de um receptor.");
+                } else if (connections == 1 && !g.authorized.load()) {
+                    postStatus(extraConnectionLock
+                        ? L"Restou um receptor. Clique em Liberar novamente para continuar."
+                        : L"Receptor conectado — clique em Liberar transmissão quando estiver pronto.");
+                } else if (connections == 0) {
+                    postStatus(L"Fonte NDI ativa — aguardando receptor.");
+                }
+            } else if (connections > 1) {
+                postStatus(L"Modo rápido — aviso: há mais de um receptor conectado.");
+            }
         }
-        if (!sender.sendFrame(frame.data(), width, height, fps)) {
-            postStatus(L"Falha ao enviar frame NDI.");
-            break;
+
+        if (mode == TransmissionMode::Protected && !g.authorized.load()) {
+            const auto& protectedFrame = extraConnectionLock ? extraConnectionFrame : waitingFrame;
+            if (!sender.sendFrame(protectedFrame.data(), placeholderWidth, placeholderHeight, fps)) {
+                postStatus(L"Falha ao enviar tela protegida NDI.");
+                break;
+            }
+        } else {
+            if (!captureToBuffer(source, showCursor, frame, width, height)) {
+                postStatus(L"Falha de captura. A transmissão foi encerrada.");
+                break;
+            }
+            if (!sender.sendFrame(frame.data(), width, height, fps)) {
+                postStatus(L"Falha ao enviar frame NDI.");
+                break;
+            }
         }
+
         nextFrame += std::chrono::microseconds(1000000 / fps);
         std::this_thread::sleep_until(nextFrame);
         if (std::chrono::steady_clock::now() - nextFrame > 1s) nextFrame = std::chrono::steady_clock::now();
@@ -197,6 +337,9 @@ void transmissionWorker(CaptureSource source, std::string sourceName, int fps, b
     sender.close();
     g.running = false;
     g.stopRequested = false;
+    g.authorized = false;
+    g.receiverCount = 0;
+    postReceiverCount(0);
     postStatus(L"Transmissão encerrada.");
     PostMessageW(g.window, kWorkerEnded, 0, 0);
 }
@@ -213,15 +356,29 @@ void startTransmission() {
         MessageBoxW(g.window, L"Selecione uma fonte de captura válida.", L"Transmissor NDI", MB_OK | MB_ICONWARNING);
         return;
     }
+
     collectSettings();
     const int fps = g.settings.fps;
     const bool showCursor = g.settings.showCursor;
+    const TransmissionMode mode = g.settings.mode;
+    g.activeProtectedMode = mode == TransmissionMode::Protected;
+    g.authorized = mode == TransmissionMode::Quick;
+    g.receiverCount = 0;
     g.stopRequested = false;
     g.running = true;
     updateControls();
+
     std::lock_guard<std::mutex> lock(g.workerMutex);
     if (g.worker.joinable()) g.worker.join();
-    g.worker = std::thread(transmissionWorker, source, utf8(sourceName), fps, showCursor);
+    g.worker = std::thread(transmissionWorker, source, sourceName, utf8(sourceName), fps, showCursor, mode);
+}
+
+void releaseTransmission() {
+    if (!g.running.load() || !g.activeProtectedMode) return;
+    if (g.receiverCount.load() != 1) return;
+    g.authorized = true;
+    postStatus(L"Conteúdo liberado para o receptor conectado.");
+    updateControls();
 }
 
 void stopTransmission() {
@@ -234,13 +391,13 @@ void stopTransmission() {
 
 void showHelp() {
     MessageBoxW(g.window,
-        L"Esta é a nova base V3 do Transmissor NDI Portátil.\n\n"
-        L"1. Escolha Monitor ou Janela.\n"
-        L"2. Selecione a origem.\n"
-        L"3. Defina 30 ou 60 FPS.\n"
-        L"4. Clique em Iniciar transmissão.\n\n"
-        L"Nesta etapa a arquitetura foi reconstruída e a transmissão básica está isolada em módulos. "
-        L"Os modos protegido/rápido e as proteções de privacidade serão adicionados sobre esta base após a compilação ficar estável.",
+        L"1. Escolha Monitor ou Janela e selecione a origem.\n"
+        L"2. No Modo protegido, a fonte NDI aparece primeiro com uma tela de espera.\n"
+        L"3. Quando exatamente um receptor conectar, clique em Liberar transmissão.\n"
+        L"4. Se entrar outro receptor, a imagem é bloqueada imediatamente.\n"
+        L"5. Mesmo depois de voltar a um receptor, é necessário clicar em Liberar novamente.\n"
+        L"6. No Modo rápido, a imagem começa imediatamente e conexões extras apenas geram aviso.\n\n"
+        L"Nenhuma transmissão começa automaticamente ao abrir o aplicativo.",
         L"Como usar — V3", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -271,9 +428,11 @@ void createUi() {
     g.protectedMode = addControl(L"BUTTON", L"Modo protegido", BS_AUTORADIOBUTTON | WS_GROUP, 24, 262, 170, 26, IdProtected);
     g.quickMode = addControl(L"BUTTON", L"Modo rápido", BS_AUTORADIOBUTTON, 204, 262, 150, 26, IdQuick);
 
-    g.status = addControl(L"STATIC", L"Pronto. Nenhuma transmissão iniciada.", 0, 24, 322, 686, 26, IdStatus);
-    g.start = addControl(L"BUTTON", L"Iniciar transmissão", BS_DEFPUSHBUTTON, 24, 372, 220, 40, IdStart);
-    g.stop = addControl(L"BUTTON", L"Parar", BS_PUSHBUTTON, 256, 372, 140, 40, IdStop);
+    g.receivers = addControl(L"STATIC", L"Receptores: 0", 0, 24, 314, 180, 24, IdReceivers);
+    g.status = addControl(L"STATIC", L"Pronto. Nenhuma transmissão iniciada.", 0, 24, 344, 686, 26, IdStatus);
+    g.start = addControl(L"BUTTON", L"Iniciar transmissão", BS_DEFPUSHBUTTON, 24, 394, 200, 40, IdStart);
+    g.release = addControl(L"BUTTON", L"Liberar transmissão", BS_PUSHBUTTON, 236, 394, 190, 40, IdRelease);
+    g.stop = addControl(L"BUTTON", L"Parar", BS_PUSHBUTTON, 438, 394, 140, 40, IdStop);
 
     HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     EnumChildWindows(g.window, [](HWND child, LPARAM value) -> BOOL {
@@ -303,6 +462,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == IdCaptureKind && HIWORD(wp) == CBN_SELCHANGE) refreshSources();
         else if (id == IdRefresh) refreshSources();
         else if (id == IdStart) startTransmission();
+        else if (id == IdRelease) releaseTransmission();
         else if (id == IdStop) stopTransmission();
         else if (id == IdHelp) showHelp();
         return 0;
@@ -311,6 +471,19 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case kStatusMessage: {
         std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
         SetWindowTextW(g.status, text->c_str());
+        updateControls();
+        return 0;
+    }
+
+    case kReceiverMessage: {
+        const int count = static_cast<int>(wp);
+        const std::wstring text = L"Receptores: " + std::to_wstring(count);
+        SetWindowTextW(g.receivers, text.c_str());
+        if (g.activeProtectedMode && count > 1) {
+            FLASHWINFO flash{sizeof(flash), hwnd, FLASHW_TRAY, 1, 0};
+            FlashWindowEx(&flash);
+        }
+        updateControls();
         return 0;
     }
 
@@ -356,7 +529,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
 
     HWND hwnd = CreateWindowExW(0, kWindowClass, L"Transmissor NDI Portátil — V3",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 760, 480, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 510, nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
 
     ShowWindow(hwnd, show);
