@@ -5,6 +5,7 @@
 #include <uxtheme.h>
 #include <ws2tcpip.h>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -12,6 +13,8 @@ namespace {
 constexpr int kIdProtected = 1007;
 constexpr int kIdQuick = 1008;
 constexpr int kIdStart = 1011;
+constexpr int kIdRelease = 1012;
+constexpr int kIdStatus = 1014;
 constexpr int kIpEditId = 1201;
 constexpr int kIpLabelId = 1202;
 constexpr int kIpHintId = 1203;
@@ -22,6 +25,8 @@ HWND gIpLabel{};
 HWND gIpHint{};
 std::mutex gIpMutex;
 std::string gConfiguredIp;
+std::atomic_bool gReleased{false};
+std::atomic_bool gAudioAllowed{false};
 HHOOK gHook{};
 
 std::string utf8(const std::wstring& text) {
@@ -57,6 +62,36 @@ bool readyToStart() {
     return controlText(start).find(L"Iniciar") != std::wstring::npos;
 }
 
+bool transmissionRunning() {
+    HWND start = gMain ? GetDlgItem(gMain, kIdStart) : nullptr;
+    if (!start) return false;
+    const std::wstring text = controlText(start);
+    return text.find(L"Parar transmissão") != std::wstring::npos;
+}
+
+bool privacyActive() {
+    HWND status = gMain ? GetDlgItem(gMain, kIdStatus) : nullptr;
+    if (!status) return false;
+    const std::wstring text = controlText(status);
+    return text.find(L"rivacidade") != std::wstring::npos || text.find(L"rotegido") != std::wstring::npos;
+}
+
+void refreshAudioState() {
+    if (!transmissionRunning()) {
+        gAudioAllowed = false;
+        return;
+    }
+    if (privacyActive()) {
+        gAudioAllowed = false;
+        return;
+    }
+    if (!protectedMode()) {
+        gAudioAllowed = true;
+        return;
+    }
+    gAudioAllowed = gReleased.load();
+}
+
 void refreshIpControls() {
     if (!gIpEdit) return;
     const bool protectedSelected = protectedMode();
@@ -64,6 +99,7 @@ void refreshIpControls() {
     ShowWindow(gIpLabel, protectedSelected ? SW_SHOW : SW_HIDE);
     ShowWindow(gIpHint, protectedSelected ? SW_SHOW : SW_HIDE);
     EnableWindow(gIpEdit, protectedSelected && readyToStart());
+    refreshAudioState();
 }
 
 void rememberConfiguredIp() {
@@ -75,22 +111,34 @@ LRESULT CALLBACK subclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                               UINT_PTR, DWORD_PTR) {
     if (msg == WM_COMMAND) {
         const int id = LOWORD(wp);
-        if (id == kIdStart && readyToStart()) {
-            if (protectedMode()) {
-                const std::wstring ip = controlText(gIpEdit);
-                if (!validIpv4(ip)) {
-                    MessageBoxW(hwnd,
-                        L"Informe um IPv4 válido para a máquina autorizada.\n\nExemplo: 192.168.0.100",
-                        L"IP autorizado", MB_OK | MB_ICONWARNING);
-                    SetFocus(gIpEdit);
-                    return 0;
+        if (id == kIdStart) {
+            if (readyToStart()) {
+                if (protectedMode()) {
+                    const std::wstring ip = controlText(gIpEdit);
+                    if (!validIpv4(ip)) {
+                        MessageBoxW(hwnd,
+                            L"Informe um IPv4 válido para a máquina autorizada.\n\nExemplo: 192.168.0.100",
+                            L"IP autorizado", MB_OK | MB_ICONWARNING);
+                        SetFocus(gIpEdit);
+                        return 0;
+                    }
                 }
+                rememberConfiguredIp();
+                gReleased = !protectedMode();
+                gAudioAllowed = !protectedMode();
+            } else {
+                gReleased = false;
+                gAudioAllowed = false;
             }
-            rememberConfiguredIp();
+        } else if (id == kIdRelease && protectedMode()) {
+            gReleased = true;
+            refreshAudioState();
         }
     } else if (msg == WM_TIMER || msg == WM_ENABLE || msg == WM_SHOWWINDOW) {
         refreshIpControls();
     } else if (msg == WM_NCDESTROY) {
+        gReleased = false;
+        gAudioAllowed = false;
         RemoveWindowSubclass(hwnd, subclassProc, 1);
         gMain = nullptr;
         gIpEdit = nullptr;
@@ -155,4 +203,8 @@ struct UiBootstrap {
 std::string configuredReceiverIp() {
     std::lock_guard<std::mutex> lock(gIpMutex);
     return gConfiguredIp;
+}
+
+bool audioTransmissionAllowed() {
+    return gAudioAllowed.load();
 }
