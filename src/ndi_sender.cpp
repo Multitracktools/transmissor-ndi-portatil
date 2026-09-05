@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <audioclient.h>
+#include <avrt.h>
 #include <iphlpapi.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
@@ -158,10 +159,14 @@ private:
         IAudioClient* audioClient = nullptr;
         IAudioCaptureClient* captureClient = nullptr;
         WAVEFORMATEX* format = nullptr;
+        HANDLE audioEvent = nullptr;
+        HANDLE mmcssTask = nullptr;
         bool started = false;
 
         auto cleanup = [&]() {
             if (audioClient && started) audioClient->Stop();
+            if (mmcssTask) AvRevertMmThreadCharacteristics(mmcssTask);
+            if (audioEvent) CloseHandle(audioEvent);
             if (captureClient) captureClient->Release();
             if (audioClient) audioClient->Release();
             if (device) device->Release();
@@ -178,7 +183,6 @@ private:
         if (!deviceId.empty()) hr = enumerator->GetDevice(deviceId.c_str(), &device);
         else hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
 
-        // Se o dispositivo salvo deixou de existir, volta para o padrão em vez de perder o áudio inteiro.
         if ((FAILED(hr) || !device) && !deviceId.empty())
             hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
         if (FAILED(hr) || !device) { cleanup(); return; }
@@ -190,25 +194,36 @@ private:
         hr = audioClient->GetMixFormat(&format);
         if (FAILED(hr) || !format) { cleanup(); return; }
 
-        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                                     0, 0, format, nullptr);
+        audioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!audioEvent) { cleanup(); return; }
+
+        const DWORD streamFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 0, 0, format, nullptr);
+        if (FAILED(hr)) { cleanup(); return; }
+
+        hr = audioClient->SetEventHandle(audioEvent);
         if (FAILED(hr)) { cleanup(); return; }
 
         hr = audioClient->GetService(__uuidof(IAudioCaptureClient),
                                      reinterpret_cast<void**>(&captureClient));
         if (FAILED(hr) || !captureClient) { cleanup(); return; }
 
+        DWORD taskIndex = 0;
+        mmcssTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+        if (mmcssTask) AvSetMmThreadPriority(mmcssTask, AVRT_PRIORITY_HIGH);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
         hr = audioClient->Start();
         if (FAILED(hr)) { cleanup(); return; }
         started = true;
         running_ = true;
 
-        // O loopback é drenado independentemente do FPS de vídeo. Cinco milissegundos
-        // mantém a fila curta sem fazer o áudio depender do relógio de 30/60 fps.
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        // O áudio agora acorda quando o próprio WASAPI sinaliza novos dados.
+        // Isso evita polling e reduz a chance de underrun quando a captura de vídeo pesa mais.
         while (!stopRequested_.load()) {
-            drain(api, sender, captureClient, format);
-            std::this_thread::sleep_for(5ms);
+            const DWORD wait = WaitForSingleObject(audioEvent, 50);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT)
+                drain(api, sender, captureClient, format);
         }
         drain(api, sender, captureClient, format);
         cleanup();
@@ -335,7 +350,9 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
 
     NDIlib_send_create_t create{};
     create.p_ndi_name = sourceName.c_str();
-    create.clock_video = true;
+    // Captura e áudio já possuem seus próprios relógios. Evitamos que o sender bloqueie
+    // um fluxo esperando o clock do outro.
+    create.clock_video = false;
     create.clock_audio = false;
     NDIlib_send_instance_t sender = api->send_create(&create);
     if (!sender) {
@@ -348,6 +365,10 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
     module_ = module;
     api_ = api;
     sender_ = sender;
+    asyncVideoIndex_ = 0;
+    asyncVideoSubmitted_ = false;
+    asyncVideoBuffers_[0].clear();
+    asyncVideoBuffers_[1].clear();
 
     if (!gTrustedIp.empty()) {
         if (!installReceiverIpFilter(gTrustedIp, error)) {
@@ -356,18 +377,25 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
         }
     }
 
-    // Áudio tem fluxo próprio e não depende mais da frequência do vídeo.
-    // Falha de áudio não impede a transmissão de imagem.
     gAudioWorker.start(api, sender, configuredAudioDeviceId());
     return true;
 }
 
 void NdiSender::close() {
-    // O worker precisa terminar antes de destruir o sender NDI que ele utiliza.
+    // O worker de áudio termina antes de destruir o sender que ele utiliza.
     gAudioWorker.stop();
+
+    auto* api = static_cast<const NDIlib_v6*>(api_);
+    if (api && sender_ && asyncVideoSubmitted_) {
+        // Chamada síncrona nula garante que o último buffer async não está mais em uso.
+        api->send_send_video_v2(static_cast<NDIlib_send_instance_t>(sender_), nullptr);
+    }
+    asyncVideoSubmitted_ = false;
+    asyncVideoBuffers_[0].clear();
+    asyncVideoBuffers_[1].clear();
+
     removeReceiverIpFilter();
     gTrustedIp.clear();
-    auto* api = static_cast<const NDIlib_v6*>(api_);
     if (api && sender_) api->send_destroy(static_cast<NDIlib_send_instance_t>(sender_));
     if (api) api->destroy();
     if (module_) FreeLibrary(static_cast<HMODULE>(module_));
@@ -381,6 +409,13 @@ bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int f
     if (!api || !sender_ || !data || width <= 0 || height <= 0 || fps <= 0) return false;
     auto sender = static_cast<NDIlib_send_instance_t>(sender_);
 
+    // O envio async evita que compressão/conversão/rede do vídeo segurem a thread de áudio.
+    // Mantemos dois buffers: ao submeter o próximo quadro, o anterior é liberado pelo SDK.
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    auto& buffer = asyncVideoBuffers_[asyncVideoIndex_];
+    buffer.resize(bytes);
+    std::memcpy(buffer.data(), data, bytes);
+
     NDIlib_video_frame_v2_t frame{};
     frame.xres = width;
     frame.yres = height;
@@ -390,9 +425,12 @@ bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int f
     frame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
     frame.frame_format_type = NDIlib_frame_format_type_progressive;
     frame.timecode = NDIlib_send_timecode_synthesize;
-    frame.p_data = const_cast<std::uint8_t*>(data);
+    frame.p_data = buffer.data();
     frame.line_stride_in_bytes = width * 4;
-    api->send_send_video_v2(sender, &frame);
+    api->send_send_video_async_v2(sender, &frame);
+
+    asyncVideoSubmitted_ = true;
+    asyncVideoIndex_ = 1 - asyncVideoIndex_;
     return true;
 }
 
