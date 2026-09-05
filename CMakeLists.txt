@@ -45,6 +45,7 @@ target_link_libraries(transmissor-ndi PRIVATE
   fwpuclnt
   ole32
   uuid
+  avrt
 )
 
 if(MSVC)
