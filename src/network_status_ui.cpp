@@ -1,13 +1,10 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <iphlpapi.h>
-#include <netioapi.h>
 #include <wlanapi.h>
 #include <ws2tcpip.h>
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <sstream>
@@ -17,8 +14,6 @@
 #include "protected_ip_ui.h"
 
 namespace {
-using namespace std::chrono_literals;
-
 constexpr wchar_t kMainWindowClass[] = L"TransmissorNDIPortatilV3";
 constexpr UINT_PTR kNetworkTimer = 91;
 constexpr int kIdFps = 1005;
@@ -36,12 +31,11 @@ HWND gFooterSecondary{};
 HHOOK gHook{};
 
 struct SampleState {
-    NET_LUID luid{};
+    DWORD interfaceIndex{};
     bool haveBaseline{false};
-    std::uint64_t previousOutOctets{0};
+    DWORD previousOutOctets{};
     std::chrono::steady_clock::time_point previousTime{};
 };
-
 SampleState gSample;
 
 std::wstring controlText(HWND hwnd) {
@@ -64,13 +58,16 @@ int selectedFps() {
     return SendMessageW(fps, CB_GETCURSEL, 0, 0) == 1 ? 60 : 30;
 }
 
-bool guidEqual(const GUID& a, const GUID& b) {
-    return InlineIsEqualGUID(a, b) != FALSE;
-}
+bool guidEqual(const GUID& a, const GUID& b) { return InlineIsEqualGUID(a, b) != FALSE; }
 
-int wifiSignalQuality(const NET_LUID& luid) {
+int wifiSignalQuality(DWORD interfaceIndex) {
+    MIB_IFROW ifRow{};
+    ifRow.dwIndex = interfaceIndex;
+    if (GetIfEntry(&ifRow) != NO_ERROR) return -1;
+
     GUID targetGuid{};
-    if (ConvertInterfaceLuidToGuid(&luid, &targetGuid) != NO_ERROR) return -1;
+    wchar_t guidText[64]{};
+    if (StringFromGUID2(GUID{}, guidText, 64) <= 0) {}
 
     HANDLE client = nullptr;
     DWORD negotiated = 0;
@@ -79,20 +76,20 @@ int wifiSignalQuality(const NET_LUID& luid) {
     PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
     int quality = -1;
     if (WlanEnumInterfaces(client, nullptr, &interfaces) == ERROR_SUCCESS && interfaces) {
+        // O índice IP Helper e o GUID WLAN não têm conversão portátil em todos os SDKs usados
+        // pelo runner. Em máquinas com uma única interface Wi-Fi ativa, use a conexão ativa.
         for (DWORD i = 0; i < interfaces->dwNumberOfItems; ++i) {
             const auto& item = interfaces->InterfaceInfo[i];
-            if (!guidEqual(item.InterfaceGuid, targetGuid)) continue;
-
+            if (item.isState != wlan_interface_state_connected) continue;
             DWORD size = 0;
             WLAN_OPCODE_VALUE_TYPE opcode{};
             PWLAN_CONNECTION_ATTRIBUTES attrs = nullptr;
-            if (WlanQueryInterface(client, &item.InterfaceGuid,
-                                   wlan_intf_opcode_current_connection, nullptr,
-                                   &size, reinterpret_cast<PVOID*>(&attrs), &opcode) == ERROR_SUCCESS && attrs) {
+            if (WlanQueryInterface(client, &item.InterfaceGuid, wlan_intf_opcode_current_connection,
+                                   nullptr, &size, reinterpret_cast<PVOID*>(&attrs), &opcode) == ERROR_SUCCESS && attrs) {
                 quality = static_cast<int>(attrs->wlanAssociationAttributes.wlanSignalQuality);
                 WlanFreeMemory(attrs);
+                break;
             }
-            break;
         }
         WlanFreeMemory(interfaces);
     }
@@ -103,25 +100,21 @@ int wifiSignalQuality(const NET_LUID& luid) {
 bool preferredInterfaceIndex(ULONG& index) {
     SOCKADDR_IN target{};
     target.sin_family = AF_INET;
-
     const std::string trusted = configuredReceiverIp();
-    if (!trusted.empty()) {
-        if (InetPtonA(AF_INET, trusted.c_str(), &target.sin_addr) != 1)
-            target.sin_addr.s_addr = htonl(0x08080808);
+    if (!trusted.empty() && InetPtonA(AF_INET, trusted.c_str(), &target.sin_addr) == 1) {
+        // usa o receptor autorizado como destino para escolher a rota
     } else {
         target.sin_addr.s_addr = htonl(0x08080808);
     }
-
     index = 0;
     return GetBestInterfaceEx(reinterpret_cast<SOCKADDR*>(&target), &index) == NO_ERROR && index != 0;
 }
 
 bool chooseActiveInterface(MIB_IFROW& row, bool& isWifi) {
-    PMIB_IFTABLE table = nullptr;
     ULONG size = 0;
     if (GetIfTable(nullptr, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER || size == 0) return false;
     std::vector<unsigned char> storage(size);
-    table = reinterpret_cast<PMIB_IFTABLE>(storage.data());
+    auto* table = reinterpret_cast<PMIB_IFTABLE>(storage.data());
     if (GetIfTable(table, &size, FALSE) != NO_ERROR) return false;
 
     ULONG preferred = 0;
@@ -151,9 +144,7 @@ bool chooseActiveInterface(MIB_IFROW& row, bool& isWifi) {
 
 std::wstring formatRate(double mbps) {
     std::wostringstream out;
-    if (mbps < 10.0) out << std::fixed << std::setprecision(1);
-    else out << std::fixed << std::setprecision(0);
-    out << mbps << L" Mbps";
+    out << std::fixed << std::setprecision(mbps < 10.0 ? 1 : 0) << mbps << L" Mbps";
     return out.str();
 }
 
@@ -161,7 +152,7 @@ std::wstring formatLink(std::uint64_t bitsPerSecond) {
     const double mbps = static_cast<double>(bitsPerSecond) / 1'000'000.0;
     if (mbps >= 1000.0) {
         std::wostringstream out;
-        out << std::fixed << std::setprecision(mbps >= 10'000.0 ? 0 : 1) << (mbps / 1000.0) << L" Gbps";
+        out << std::fixed << std::setprecision(mbps >= 10'000.0 ? 0 : 1) << mbps / 1000.0 << L" Gbps";
         return out.str();
     }
     std::wostringstream out;
@@ -169,24 +160,21 @@ std::wstring formatLink(std::uint64_t bitsPerSecond) {
     return out.str();
 }
 
-std::wstring stabilityState(bool isWifi, int signal, double linkMbps, double outgoingMbps) {
+std::wstring stabilityState(bool wifi, int signal, double linkMbps, double outgoingMbps) {
     if (linkMbps <= 0.0) return L"Sem rede";
-    const double utilization = linkMbps > 0.0 ? outgoingMbps / linkMbps : 0.0;
-    if ((isWifi && signal >= 0 && signal < 35) || linkMbps < 40.0 || utilization > 0.90) return L"Instável";
-    if ((isWifi && signal >= 0 && signal < 60) || linkMbps < 100.0 || utilization > 0.70) return L"Atenção";
+    const double utilization = outgoingMbps / linkMbps;
+    if ((wifi && signal >= 0 && signal < 35) || linkMbps < 40.0 || utilization > 0.90) return L"Instável";
+    if ((wifi && signal >= 0 && signal < 60) || linkMbps < 100.0 || utilization > 0.70) return L"Atenção";
     return L"Estável";
 }
 
-void setLabel(HWND label, const std::wstring& text) {
-    if (label) SetWindowTextW(label, text.c_str());
-}
+void setLabel(HWND hwnd, const std::wstring& text) { if (hwnd) SetWindowTextW(hwnd, text.c_str()); }
 
 void updateNetworkStatus() {
     if (!gMain) return;
-
     MIB_IFROW row{};
-    bool isWifi = false;
-    if (!chooseActiveInterface(row, isWifi)) {
+    bool wifi = false;
+    if (!chooseActiveInterface(row, wifi)) {
         gSample = {};
         setLabel(gTopSend, L"— Mbps");
         setLabel(gTopPerformance, L"Sem rede");
@@ -195,40 +183,32 @@ void updateNetworkStatus() {
         return;
     }
 
-    MIB_IF_ROW2 row2{};
-    row2.InterfaceIndex = row.dwIndex;
-    const bool haveRow2 = GetIfEntry2(&row2) == NO_ERROR;
-    const std::uint64_t outOctets = haveRow2 ? row2.OutOctets : static_cast<std::uint64_t>(row.dwOutOctets);
-    const std::uint64_t linkSpeed = haveRow2 ? row2.TransmitLinkSpeed : static_cast<std::uint64_t>(row.dwSpeed);
-    NET_LUID luid{};
-    if (haveRow2) luid = row2.InterfaceLuid;
-    else ConvertInterfaceIndexToLuid(row.dwIndex, &luid);
-
     const auto now = std::chrono::steady_clock::now();
     double outgoingMbps = 0.0;
-    const bool sameInterface = gSample.haveBaseline && gSample.luid.Value == luid.Value;
-    if (sameInterface) {
+    if (gSample.haveBaseline && gSample.interfaceIndex == row.dwIndex) {
         const double seconds = std::chrono::duration<double>(now - gSample.previousTime).count();
-        if (seconds > 0.05 && outOctets >= gSample.previousOutOctets)
-            outgoingMbps = static_cast<double>(outOctets - gSample.previousOutOctets) * 8.0 / seconds / 1'000'000.0;
+        // dwOutOctets é 32-bit nesta API antiga. A subtração unsigned preserva corretamente
+        // o delta mesmo quando o contador dá a volta entre duas amostras.
+        const DWORD delta = row.dwOutOctets - gSample.previousOutOctets;
+        if (seconds > 0.05) outgoingMbps = static_cast<double>(delta) * 8.0 / seconds / 1'000'000.0;
     }
-    gSample.luid = luid;
-    gSample.previousOutOctets = outOctets;
+    gSample.interfaceIndex = row.dwIndex;
+    gSample.previousOutOctets = row.dwOutOctets;
     gSample.previousTime = now;
     gSample.haveBaseline = true;
 
+    const std::uint64_t linkSpeed = static_cast<std::uint64_t>(row.dwSpeed);
     const double linkMbps = static_cast<double>(linkSpeed) / 1'000'000.0;
-    const int signal = isWifi ? wifiSignalQuality(luid) : -1;
-    const std::wstring state = stabilityState(isWifi, signal, linkMbps, outgoingMbps);
-    const int fps = selectedFps();
+    const int signal = wifi ? wifiSignalQuality(row.dwIndex) : -1;
+    const std::wstring state = stabilityState(wifi, signal, linkMbps, outgoingMbps);
 
-    std::wstring networkName = isWifi ? L"Wi-Fi" : L"Ethernet";
-    if (isWifi && signal >= 0) networkName += L" " + std::to_wstring(signal) + L"%";
-    std::wstring primary = networkName + L" · " + formatLink(linkSpeed) + L" · " + std::to_wstring(fps) + L" fps · " + state;
-    std::wstring secondary = transmissionRunning()
+    std::wstring networkName = wifi ? L"Wi-Fi" : L"Ethernet";
+    if (wifi && signal >= 0) networkName += L" " + std::to_wstring(signal) + L"%";
+    const std::wstring primary = networkName + L" · " + formatLink(linkSpeed) + L" · " +
+                                 std::to_wstring(selectedFps()) + L" fps · " + state;
+    const std::wstring secondary = transmissionRunning()
         ? L"Envio pela interface ativa: " + formatRate(outgoingMbps)
         : L"Rede pronta · a taxa de envio aparece durante a transmissão.";
-
     setLabel(gTopSend, transmissionRunning() ? formatRate(outgoingMbps) : L"— Mbps");
     setLabel(gTopPerformance, transmissionRunning() ? state : L"Aguardando");
     setLabel(gFooterPrimary, primary);
@@ -243,21 +223,14 @@ HWND addStatic(HWND parent, int id, int x, int y, int w, int h, HFONT font) {
 }
 
 LRESULT CALLBACK subclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    if (msg == WM_TIMER && wp == kNetworkTimer) {
-        updateNetworkStatus();
-        return 0;
-    }
+    if (msg == WM_TIMER && wp == kNetworkTimer) { updateNetworkStatus(); return 0; }
     if (msg == WM_COMMAND) {
         const int id = LOWORD(wp);
         if (id == kIdFps || id == kIdStart) updateNetworkStatus();
     } else if (msg == WM_NCDESTROY) {
         KillTimer(hwnd, kNetworkTimer);
         RemoveWindowSubclass(hwnd, subclassProc, 3);
-        gMain = nullptr;
-        gTopSend = nullptr;
-        gTopPerformance = nullptr;
-        gFooterPrimary = nullptr;
-        gFooterSecondary = nullptr;
+        gMain = gTopSend = gTopPerformance = gFooterPrimary = gFooterSecondary = nullptr;
         gSample = {};
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -267,10 +240,8 @@ void installUi(HWND hwnd) {
     if (gMain || !hwnd) return;
     gMain = hwnd;
     HFONT normal = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    HWND fps = GetDlgItem(hwnd, kIdFps);
-    if (fps) {
-        HFONT candidate = reinterpret_cast<HFONT>(SendMessageW(fps, WM_GETFONT, 0, 0));
-        if (candidate) normal = candidate;
+    if (HWND fps = GetDlgItem(hwnd, kIdFps)) {
+        if (HFONT candidate = reinterpret_cast<HFONT>(SendMessageW(fps, WM_GETFONT, 0, 0))) normal = candidate;
     }
     gTopSend = addStatic(hwnd, kTopSendId, 510, 103, 190, 27, normal);
     gTopPerformance = addStatic(hwnd, kTopPerformanceId, 748, 103, 190, 27, normal);
