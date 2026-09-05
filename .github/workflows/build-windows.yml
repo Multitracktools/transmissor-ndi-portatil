@@ -55,8 +55,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           Copy-Item `
-            "build\Release\Transmissor NDI Portatil.exe" `
-            "dist\Transmissor NDI Portatil.exe"
+            "build\Release\Zosma Transmitter.exe" `
+            "dist\Zosma Transmitter.exe"
 
           $ndiDll = Get-ChildItem `
             -Path "$env:RUNNER_TEMP\ndi-runtime", "C:\Program Files\NDI", "C:\Program Files\NewTek" `
@@ -79,7 +79,7 @@ jobs:
       - name: Publicar artifact de teste
         uses: actions/upload-artifact@v4
         with:
-          name: Transmissor-NDI-Portatil-Windows-x64
+          name: Zosma-Transmitter-Windows-x64
           path: dist/*
           if-no-files-found: error
           retention-days: 30
