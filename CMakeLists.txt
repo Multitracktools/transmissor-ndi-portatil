@@ -9,12 +9,19 @@ add_executable(transmissor-ndi WIN32
   src/main.cpp
   src/capture.cpp
   src/ndi_sender.cpp
+  src/ndi_sender_tray.cpp
   src/ip_filter.cpp
   src/protected_ip_ui.cpp
   src/static_preview_policy.cpp
   src/tray_controller.cpp
   src/settings.cpp
   src/resources.rc
+)
+
+# Renomeia somente a implementação original de sendFrame() para sendFrameRaw().
+# O wrapper em ndi_sender_tray.cpp decide se envia o quadro real ou a tela manual de privacidade.
+set_source_files_properties(src/ndi_sender.cpp PROPERTIES
+  COMPILE_DEFINITIONS "NDI_SENDER_IMPL=1"
 )
 
 target_compile_features(transmissor-ndi PRIVATE cxx_std_20)
