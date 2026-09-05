@@ -312,7 +312,7 @@ LRESULT CALLBACK aboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HFONT title = makeFont(28, FW_SEMIBOLD);
         HFONT body = makeFont(15, FW_NORMAL);
         HFONT bold = makeFont(15, FW_SEMIBOLD);
-        HFONT small = makeFont(13, FW_NORMAL);
+        HFONT smallFont = makeFont(13, FW_NORMAL);
         HGDIOBJ oldFont = title ? SelectObject(dc, title) : nullptr;
         SetTextColor(dc, kText);
         RECT r{28, 24, 552, 58};
@@ -340,7 +340,7 @@ LRESULT CALLBACK aboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, RGB(199, 220, 247));
         r = {48, 146, 530, 174};
         DrawTextW(dc, L"Ideias transformadas em software.", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        if (small) SelectObject(dc, small);
+        if (smallFont) SelectObject(dc, smallFont);
         SetTextColor(dc, kMuted);
         r = {48, 178, 530, 208};
         DrawTextW(dc, L"zosma.com.br", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -349,7 +349,7 @@ LRESULT CALLBACK aboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetTextColor(dc, kText);
         r = {28, 242, 552, 268};
         DrawTextW(dc, L"Tecnologia NDI®", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        if (small) SelectObject(dc, small);
+        if (smallFont) SelectObject(dc, smallFont);
         SetTextColor(dc, kMuted);
         r = {28, 270, 552, 352};
         DrawTextW(dc,
@@ -361,7 +361,7 @@ LRESULT CALLBACK aboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (title) DeleteObject(title);
         if (body) DeleteObject(body);
         if (bold) DeleteObject(bold);
-        if (small) DeleteObject(small);
+        if (smallFont) DeleteObject(smallFont);
         EndPaint(hwnd, &ps);
         return 0;
     }
