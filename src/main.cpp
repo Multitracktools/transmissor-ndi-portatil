@@ -29,6 +29,7 @@ constexpr UINT kStatusMessage = WM_APP + 1;
 constexpr UINT kWorkerEnded = WM_APP + 2;
 constexpr UINT kReceiverMessage = WM_APP + 3;
 constexpr UINT_PTR kPreviewTimer = 77;
+constexpr auto kPrivacyScanInterval = 200ms;
 
 constexpr COLORREF kBg = RGB(12, 18, 28);
 constexpr COLORREF kPanel = RGB(24, 32, 45);
@@ -521,7 +522,10 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
     int width = 0;
     int height = 0;
     int previousConnections = -1;
-    bool previousPrivacy = false;
+    bool privacy = protectedContentVisible(source);
+    bool previousPrivacy = privacy;
+    g.privacyBlocked = privacy;
+    auto nextPrivacyScan = std::chrono::steady_clock::now() + kPrivacyScanInterval;
     auto nextFrame = std::chrono::steady_clock::now();
 
     while (!g.stopRequested.load()) {
@@ -549,7 +553,11 @@ void transmissionWorker(CaptureSource source, std::wstring sourceDisplayName,
             }
         }
 
-        const bool privacy = protectedContentVisible(source);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextPrivacyScan) {
+            privacy = protectedContentVisible(source);
+            nextPrivacyScan = now + kPrivacyScanInterval;
+        }
         g.privacyBlocked = privacy;
         if (privacy != previousPrivacy) {
             previousPrivacy = privacy;
