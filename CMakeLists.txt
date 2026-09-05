@@ -12,6 +12,7 @@ add_executable(transmissor-ndi WIN32
   src/ip_filter.cpp
   src/protected_ip_ui.cpp
   src/static_preview_policy.cpp
+  src/tray_controller.cpp
   src/settings.cpp
   src/resources.rc
 )
