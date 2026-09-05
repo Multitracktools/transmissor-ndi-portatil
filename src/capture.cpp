@@ -1,5 +1,6 @@
 #include "capture.h"
 #include <algorithm>
+#include <cstring>
 
 namespace {
 BOOL CALLBACK enumMonitorProc(HMONITOR monitor, HDC, LPRECT bounds, LPARAM data) {
@@ -46,6 +47,68 @@ void drawCursor(HDC dc, const RECT& bounds) {
     }
     DrawIconEx(dc, x, y, cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
 }
+
+class GdiCaptureSurface {
+public:
+    ~GdiCaptureSurface() { reset(); }
+
+    bool ensure(int width, int height) {
+        if (width <= 0 || height <= 0) return false;
+        if (screen_ && mem_ && bitmap_ && pixels_ && width_ == width && height_ == height) return true;
+
+        reset();
+        screen_ = GetDC(nullptr);
+        if (!screen_) return false;
+        mem_ = CreateCompatibleDC(screen_);
+        if (!mem_) { reset(); return false; }
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        bitmap_ = CreateDIBSection(screen_, &info, DIB_RGB_COLORS, &pixels_, nullptr, 0);
+        if (!bitmap_ || !pixels_) { reset(); return false; }
+        oldBitmap_ = SelectObject(mem_, bitmap_);
+        width_ = width;
+        height_ = height;
+        return true;
+    }
+
+    HDC screen() const { return screen_; }
+    HDC memory() const { return mem_; }
+    void* pixels() const { return pixels_; }
+
+private:
+    void reset() {
+        if (mem_ && oldBitmap_) SelectObject(mem_, oldBitmap_);
+        oldBitmap_ = nullptr;
+        if (bitmap_) DeleteObject(bitmap_);
+        bitmap_ = nullptr;
+        pixels_ = nullptr;
+        if (mem_) DeleteDC(mem_);
+        mem_ = nullptr;
+        if (screen_) ReleaseDC(nullptr, screen_);
+        screen_ = nullptr;
+        width_ = 0;
+        height_ = 0;
+    }
+
+    HDC screen_{};
+    HDC mem_{};
+    HBITMAP bitmap_{};
+    HGDIOBJ oldBitmap_{};
+    void* pixels_{};
+    int width_{};
+    int height_{};
+};
+
+// A captura principal acontece sempre na mesma thread de transmissão. Manter a superfície
+// por thread evita criar/destruir DC e DIB a cada quadro (30/60 vezes por segundo).
+thread_local GdiCaptureSurface gCaptureSurface;
 }
 
 std::vector<MonitorSource> enumerateMonitors() {
@@ -66,44 +129,28 @@ bool captureToBuffer(const CaptureSource& source, bool showCursor, std::vector<u
     if (source.kind == CaptureKind::Window) {
         if (!IsWindow(source.window) || IsIconic(source.window) || !GetWindowRect(source.window, &bounds)) return false;
     }
+
     width = bounds.right - bounds.left;
     height = bounds.bottom - bounds.top;
-    if (width <= 0 || height <= 0) return false;
+    if (width <= 0 || height <= 0 || !gCaptureSurface.ensure(width, height)) return false;
 
-    HDC screen = GetDC(nullptr);
-    HDC mem = screen ? CreateCompatibleDC(screen) : nullptr;
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    void* pixels = nullptr;
-    HBITMAP bitmap = mem ? CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0) : nullptr;
-    if (!screen || !mem || !bitmap || !pixels) {
-        if (bitmap) DeleteObject(bitmap);
-        if (mem) DeleteDC(mem);
-        if (screen) ReleaseDC(nullptr, screen);
-        return false;
-    }
-    HGDIOBJ old = SelectObject(mem, bitmap);
+    HDC screen = gCaptureSurface.screen();
+    HDC mem = gCaptureSurface.memory();
     bool ok = false;
+
     if (source.kind == CaptureKind::Window) {
+        // PW_RENDERFULLCONTENT (2) costuma preservar melhor conteúdo acelerado em janelas modernas.
         ok = PrintWindow(source.window, mem, 2) != 0;
         if (!ok) ok = BitBlt(mem, 0, 0, width, height, screen, bounds.left, bounds.top, SRCCOPY | CAPTUREBLT) != 0;
     } else {
         ok = BitBlt(mem, 0, 0, width, height, screen, bounds.left, bounds.top, SRCCOPY | CAPTUREBLT) != 0;
         if (ok && showCursor) drawCursor(mem, bounds);
     }
-    if (ok) {
-        const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
-        bgra.resize(bytes);
-        std::copy_n(static_cast<unsigned char*>(pixels), bytes, bgra.data());
-    }
-    SelectObject(mem, old);
-    DeleteObject(bitmap);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
-    return ok;
+
+    if (!ok) return false;
+
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    if (bgra.size() != bytes) bgra.resize(bytes);
+    std::memcpy(bgra.data(), gCaptureSurface.pixels(), bytes);
+    return true;
 }
