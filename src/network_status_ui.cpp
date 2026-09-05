@@ -116,38 +116,36 @@ bool preferredInterfaceIndex(ULONG& index) {
     return GetBestInterfaceEx(reinterpret_cast<SOCKADDR*>(&target), &index) == NO_ERROR && index != 0;
 }
 
-bool chooseActiveInterface(MIB_IF_ROW2& row, bool& isWifi) {
+bool chooseActiveInterface(MIB_IFROW& row, bool& isWifi) {
+    PMIB_IFTABLE table = nullptr;
+    ULONG size = 0;
+    if (GetIfTable(nullptr, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER || size == 0) return false;
+    std::vector<unsigned char> storage(size);
+    table = reinterpret_cast<PMIB_IFTABLE>(storage.data());
+    if (GetIfTable(table, &size, FALSE) != NO_ERROR) return false;
+
     ULONG preferred = 0;
     preferredInterfaceIndex(preferred);
-
-    PMIB_IF_TABLE2 table = nullptr;
-    if (GetIfTable2(&table) != NO_ERROR || !table) return false;
-
-    const MIB_IF_ROW2* chosen = nullptr;
-    for (ULONG i = 0; i < table->NumEntries; ++i) {
-        const auto& candidate = table->Table[i];
-        if (candidate.InterfaceIndex == preferred && candidate.OperStatus == IfOperStatusUp) {
+    const MIB_IFROW* chosen = nullptr;
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& candidate = table->table[i];
+        if (candidate.dwIndex == preferred && candidate.dwOperStatus == IF_OPER_STATUS_OPERATIONAL) {
             chosen = &candidate;
             break;
         }
     }
-
     if (!chosen) {
-        for (ULONG i = 0; i < table->NumEntries; ++i) {
-            const auto& candidate = table->Table[i];
-            if (candidate.OperStatus != IfOperStatusUp) continue;
-            if (candidate.Type == IF_TYPE_SOFTWARE_LOOPBACK || candidate.Type == IF_TYPE_TUNNEL) continue;
-            if (candidate.MediaConnectState != MediaConnectStateConnected) continue;
+        for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+            const auto& candidate = table->table[i];
+            if (candidate.dwOperStatus != IF_OPER_STATUS_OPERATIONAL) continue;
+            if (candidate.dwType == IF_TYPE_SOFTWARE_LOOPBACK || candidate.dwType == IF_TYPE_TUNNEL) continue;
             chosen = &candidate;
             break;
         }
     }
-
-    if (chosen) row = *chosen;
-    FreeMibTable(table);
     if (!chosen) return false;
-
-    isWifi = row.Type == IF_TYPE_IEEE80211;
+    row = *chosen;
+    isWifi = row.dwType == IF_TYPE_IEEE80211;
     return true;
 }
 
@@ -173,12 +171,9 @@ std::wstring formatLink(std::uint64_t bitsPerSecond) {
 
 std::wstring stabilityState(bool isWifi, int signal, double linkMbps, double outgoingMbps) {
     if (linkMbps <= 0.0) return L"Sem rede";
-
     const double utilization = linkMbps > 0.0 ? outgoingMbps / linkMbps : 0.0;
-    if ((isWifi && signal >= 0 && signal < 35) || linkMbps < 40.0 || utilization > 0.90)
-        return L"Instável";
-    if ((isWifi && signal >= 0 && signal < 60) || linkMbps < 100.0 || utilization > 0.70)
-        return L"Atenção";
+    if ((isWifi && signal >= 0 && signal < 35) || linkMbps < 40.0 || utilization > 0.90) return L"Instável";
+    if ((isWifi && signal >= 0 && signal < 60) || linkMbps < 100.0 || utilization > 0.70) return L"Atenção";
     return L"Estável";
 }
 
@@ -189,7 +184,7 @@ void setLabel(HWND label, const std::wstring& text) {
 void updateNetworkStatus() {
     if (!gMain) return;
 
-    MIB_IF_ROW2 row{};
+    MIB_IFROW row{};
     bool isWifi = false;
     if (!chooseActiveInterface(row, isWifi)) {
         gSample = {};
@@ -200,30 +195,36 @@ void updateNetworkStatus() {
         return;
     }
 
+    MIB_IF_ROW2 row2{};
+    row2.InterfaceIndex = row.dwIndex;
+    const bool haveRow2 = GetIfEntry2(&row2) == NO_ERROR;
+    const std::uint64_t outOctets = haveRow2 ? row2.OutOctets : static_cast<std::uint64_t>(row.dwOutOctets);
+    const std::uint64_t linkSpeed = haveRow2 ? row2.TransmitLinkSpeed : static_cast<std::uint64_t>(row.dwSpeed);
+    NET_LUID luid{};
+    if (haveRow2) luid = row2.InterfaceLuid;
+    else ConvertInterfaceIndexToLuid(row.dwIndex, &luid);
+
     const auto now = std::chrono::steady_clock::now();
     double outgoingMbps = 0.0;
-    const bool sameInterface = gSample.haveBaseline && gSample.luid.Value == row.InterfaceLuid.Value;
+    const bool sameInterface = gSample.haveBaseline && gSample.luid.Value == luid.Value;
     if (sameInterface) {
         const double seconds = std::chrono::duration<double>(now - gSample.previousTime).count();
-        if (seconds > 0.05 && row.OutOctets >= gSample.previousOutOctets) {
-            outgoingMbps = static_cast<double>(row.OutOctets - gSample.previousOutOctets) * 8.0 / seconds / 1'000'000.0;
-        }
+        if (seconds > 0.05 && outOctets >= gSample.previousOutOctets)
+            outgoingMbps = static_cast<double>(outOctets - gSample.previousOutOctets) * 8.0 / seconds / 1'000'000.0;
     }
-    gSample.luid = row.InterfaceLuid;
-    gSample.previousOutOctets = row.OutOctets;
+    gSample.luid = luid;
+    gSample.previousOutOctets = outOctets;
     gSample.previousTime = now;
     gSample.haveBaseline = true;
 
-    const double linkMbps = static_cast<double>(row.TransmitLinkSpeed) / 1'000'000.0;
-    const int signal = isWifi ? wifiSignalQuality(row.InterfaceLuid) : -1;
+    const double linkMbps = static_cast<double>(linkSpeed) / 1'000'000.0;
+    const int signal = isWifi ? wifiSignalQuality(luid) : -1;
     const std::wstring state = stabilityState(isWifi, signal, linkMbps, outgoingMbps);
     const int fps = selectedFps();
 
     std::wstring networkName = isWifi ? L"Wi-Fi" : L"Ethernet";
     if (isWifi && signal >= 0) networkName += L" " + std::to_wstring(signal) + L"%";
-
-    std::wstring primary = networkName + L" · " + formatLink(row.TransmitLinkSpeed) +
-                           L" · " + std::to_wstring(fps) + L" fps · " + state;
+    std::wstring primary = networkName + L" · " + formatLink(linkSpeed) + L" · " + std::to_wstring(fps) + L" fps · " + state;
     std::wstring secondary = transmissionRunning()
         ? L"Envio pela interface ativa: " + formatRate(outgoingMbps)
         : L"Rede pronta · a taxa de envio aparece durante a transmissão.";
@@ -236,14 +237,12 @@ void updateNetworkStatus() {
 
 HWND addStatic(HWND parent, int id, int x, int y, int w, int h, HFONT font) {
     HWND label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        GetModuleHandleW(nullptr), nullptr);
+        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     if (font) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     return label;
 }
 
-LRESULT CALLBACK subclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
-                              UINT_PTR, DWORD_PTR) {
+LRESULT CALLBACK subclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     if (msg == WM_TIMER && wp == kNetworkTimer) {
         updateNetworkStatus();
         return 0;
@@ -267,19 +266,16 @@ LRESULT CALLBACK subclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 void installUi(HWND hwnd) {
     if (gMain || !hwnd) return;
     gMain = hwnd;
-
     HFONT normal = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     HWND fps = GetDlgItem(hwnd, kIdFps);
     if (fps) {
         HFONT candidate = reinterpret_cast<HFONT>(SendMessageW(fps, WM_GETFONT, 0, 0));
         if (candidate) normal = candidate;
     }
-
     gTopSend = addStatic(hwnd, kTopSendId, 510, 103, 190, 27, normal);
     gTopPerformance = addStatic(hwnd, kTopPerformanceId, 748, 103, 190, 27, normal);
     gFooterPrimary = addStatic(hwnd, kFooterPrimaryId, 32, 678, 690, 26, normal);
     gFooterSecondary = addStatic(hwnd, kFooterSecondaryId, 32, 704, 690, 22, normal);
-
     SetWindowSubclass(hwnd, subclassProc, 3, 0);
     SetTimer(hwnd, kNetworkTimer, 1000, nullptr);
     updateNetworkStatus();
@@ -298,11 +294,7 @@ LRESULT CALLBACK callWndHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 struct NetworkBootstrap {
-    NetworkBootstrap() {
-        gHook = SetWindowsHookExW(WH_CALLWNDPROC, callWndHook, nullptr, GetCurrentThreadId());
-    }
-    ~NetworkBootstrap() {
-        if (gHook) UnhookWindowsHookEx(gHook);
-    }
+    NetworkBootstrap() { gHook = SetWindowsHookExW(WH_CALLWNDPROC, callWndHook, nullptr, GetCurrentThreadId()); }
+    ~NetworkBootstrap() { if (gHook) UnhookWindowsHookEx(gHook); }
 } gBootstrap;
 }
