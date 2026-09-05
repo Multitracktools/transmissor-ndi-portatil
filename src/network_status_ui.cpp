@@ -58,16 +58,10 @@ int selectedFps() {
     return SendMessageW(fps, CB_GETCURSEL, 0, 0) == 1 ? 60 : 30;
 }
 
-bool guidEqual(const GUID& a, const GUID& b) { return InlineIsEqualGUID(a, b) != FALSE; }
-
 int wifiSignalQuality(DWORD interfaceIndex) {
     MIB_IFROW ifRow{};
     ifRow.dwIndex = interfaceIndex;
     if (GetIfEntry(&ifRow) != NO_ERROR) return -1;
-
-    GUID targetGuid{};
-    wchar_t guidText[64]{};
-    if (StringFromGUID2(GUID{}, guidText, 64) <= 0) {}
 
     HANDLE client = nullptr;
     DWORD negotiated = 0;
@@ -76,8 +70,8 @@ int wifiSignalQuality(DWORD interfaceIndex) {
     PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
     int quality = -1;
     if (WlanEnumInterfaces(client, nullptr, &interfaces) == ERROR_SUCCESS && interfaces) {
-        // O índice IP Helper e o GUID WLAN não têm conversão portátil em todos os SDKs usados
-        // pelo runner. Em máquinas com uma única interface Wi-Fi ativa, use a conexão ativa.
+        // Em máquinas com uma única interface Wi-Fi ativa, usamos a conexão WLAN conectada.
+        // Evitamos conversões LUID/GUID que variam entre versões do Windows SDK do runner.
         for (DWORD i = 0; i < interfaces->dwNumberOfItems; ++i) {
             const auto& item = interfaces->InterfaceInfo[i];
             if (item.isState != wlan_interface_state_connected) continue;
@@ -187,8 +181,6 @@ void updateNetworkStatus() {
     double outgoingMbps = 0.0;
     if (gSample.haveBaseline && gSample.interfaceIndex == row.dwIndex) {
         const double seconds = std::chrono::duration<double>(now - gSample.previousTime).count();
-        // dwOutOctets é 32-bit nesta API antiga. A subtração unsigned preserva corretamente
-        // o delta mesmo quando o contador dá a volta entre duas amostras.
         const DWORD delta = row.dwOutOctets - gSample.previousOutOctets;
         if (seconds > 0.05) outgoingMbps = static_cast<double>(delta) * 8.0 / seconds / 1'000'000.0;
     }
