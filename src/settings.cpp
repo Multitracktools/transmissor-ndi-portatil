@@ -17,7 +17,7 @@ void writeInt(const std::filesystem::path& path, const wchar_t* key, int value) 
 
 AppSettings loadSettings(const std::filesystem::path& iniPath) {
     AppSettings s;
-    s.sourceName = readString(iniPath, L"sourceName", L"Zosma NDI");
+    s.sourceName = readString(iniPath, L"sourceName", L"Zosma Transmitter");
     s.captureKind = readInt(iniPath, L"captureKind", 0) == 1 ? CaptureKind::Window : CaptureKind::Monitor;
     s.sourceIndex = readInt(iniPath, L"sourceIndex", 0);
     s.resolutionIndex = readInt(iniPath, L"resolutionIndex", 0);
