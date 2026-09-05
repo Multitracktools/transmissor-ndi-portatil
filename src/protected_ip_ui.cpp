@@ -2,9 +2,9 @@
 
 #include <windows.h>
 #include <commctrl.h>
-#include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>
+#include <propvarutil.h>
 #include <uxtheme.h>
 #include <ws2tcpip.h>
 
@@ -24,6 +24,11 @@ constexpr int kIpEditId = 1201;
 constexpr int kIpLabelId = 1202;
 constexpr int kIpHintId = 1203;
 constexpr int kAudioComboId = 1210;
+
+const PROPERTYKEY kPkeyDeviceFriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+    14
+};
 
 HWND gMain{};
 HWND gIpEdit{};
@@ -154,7 +159,7 @@ void populateAudioDevices() {
                         SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && store) {
                         PROPVARIANT value;
                         PropVariantInit(&value);
-                        if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &value)) &&
+                        if (SUCCEEDED(store->GetValue(kPkeyDeviceFriendlyName, &value)) &&
                             value.vt == VT_LPWSTR && value.pwszVal) {
                             name = value.pwszVal;
                         }
