@@ -14,6 +14,7 @@ add_executable(transmissor-ndi WIN32
   src/protected_ip_ui.cpp
   src/static_preview_policy.cpp
   src/tray_controller.cpp
+  src/network_status_ui.cpp
   src/settings.cpp
   src/resources.rc
 )
@@ -49,6 +50,7 @@ target_link_libraries(transmissor-ndi PRIVATE
   dwmapi
   uxtheme
   iphlpapi
+  wlanapi
   ws2_32
   fwpuclnt
   ole32
