@@ -11,6 +11,7 @@
 #include <objbase.h>
 #include <ws2tcpip.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "Processing.NDI.Lib.h"
@@ -28,102 +30,56 @@ using namespace std::chrono_literals;
 
 std::string gTrustedIp;
 
-class WasapiLoopback {
+class AudioWorker {
 public:
-    ~WasapiLoopback() { close(); }
+    ~AudioWorker() { stop(); }
 
-    bool open() {
-        close();
-
-        const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(init)) comInitialized_ = true;
-        else if (init != RPC_E_CHANGED_MODE) return false;
-
-        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                      __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator_));
-        if (FAILED(hr)) { close(); return false; }
-
-        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eMultimedia, &device_);
-        if (FAILED(hr)) { close(); return false; }
-
-        hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                               reinterpret_cast<void**>(&audioClient_));
-        if (FAILED(hr)) { close(); return false; }
-
-        hr = audioClient_->GetMixFormat(&format_);
-        if (FAILED(hr) || !format_) { close(); return false; }
-
-        hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                                      0, 0, format_, nullptr);
-        if (FAILED(hr)) { close(); return false; }
-
-        hr = audioClient_->GetService(__uuidof(IAudioCaptureClient),
-                                      reinterpret_cast<void**>(&captureClient_));
-        if (FAILED(hr)) { close(); return false; }
-
-        hr = audioClient_->Start();
-        if (FAILED(hr)) { close(); return false; }
-
-        started_ = true;
-        return true;
+    void start(const NDIlib_v6* api, NDIlib_send_instance_t sender, std::wstring deviceId) {
+        stop();
+        if (!api || !sender) return;
+        stopRequested_ = false;
+        thread_ = std::thread([this, api, sender, deviceId = std::move(deviceId)]() {
+            run(api, sender, deviceId);
+        });
     }
 
-    void close() {
-        if (audioClient_ && started_) audioClient_->Stop();
-        started_ = false;
-        if (captureClient_) { captureClient_->Release(); captureClient_ = nullptr; }
-        if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
-        if (device_) { device_->Release(); device_ = nullptr; }
-        if (enumerator_) { enumerator_->Release(); enumerator_ = nullptr; }
-        if (format_) { CoTaskMemFree(format_); format_ = nullptr; }
-        if (comInitialized_) { CoUninitialize(); comInitialized_ = false; }
+    void stop() {
+        stopRequested_ = true;
+        if (thread_.joinable()) thread_.join();
+        running_ = false;
     }
 
-    void drain(const NDIlib_v6* api, NDIlib_send_instance_t sender, bool transmit) {
-        if (!started_ || !captureClient_ || !format_ || !api || !sender) return;
-
-        UINT32 packetFrames = 0;
-        while (SUCCEEDED(captureClient_->GetNextPacketSize(&packetFrames)) && packetFrames > 0) {
-            BYTE* data = nullptr;
-            UINT32 frames = 0;
-            DWORD flags = 0;
-            if (FAILED(captureClient_->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
-
-            if (transmit && frames > 0) sendPacket(api, sender, data, frames, flags);
-            captureClient_->ReleaseBuffer(frames);
-            packetFrames = 0;
-        }
-    }
+    bool running() const { return running_.load(); }
 
 private:
-    bool formatIsFloat() const {
-        if (!format_) return false;
-        if (format_->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
-        if (format_->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
-        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format_);
+    static bool formatIsFloat(const WAVEFORMATEX* format) {
+        if (!format) return false;
+        if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+        if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
+        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
         return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != FALSE;
     }
 
-    bool formatIsPcm() const {
-        if (!format_) return false;
-        if (format_->wFormatTag == WAVE_FORMAT_PCM) return true;
-        if (format_->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
-        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format_);
+    static bool formatIsPcm(const WAVEFORMATEX* format) {
+        if (!format) return false;
+        if (format->wFormatTag == WAVE_FORMAT_PCM) return true;
+        if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return false;
+        const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
         return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) != FALSE;
     }
 
-    float readSample(const BYTE* data, size_t sampleIndex) const {
-        if (!format_ || !data) return 0.0f;
-        const int bits = format_->wBitsPerSample;
+    static float readSample(const WAVEFORMATEX* format, const BYTE* data, size_t sampleIndex) {
+        if (!format || !data) return 0.0f;
+        const int bits = format->wBitsPerSample;
         const size_t bytesPerSample = static_cast<size_t>((bits + 7) / 8);
         const BYTE* p = data + sampleIndex * bytesPerSample;
 
-        if (formatIsFloat() && bits == 32) {
+        if (formatIsFloat(format) && bits == 32) {
             float value = 0.0f;
             std::memcpy(&value, p, sizeof(value));
             return value;
         }
-        if (!formatIsPcm()) return 0.0f;
+        if (!formatIsPcm(format)) return 0.0f;
 
         if (bits == 8) {
             return (static_cast<int>(*p) - 128) / 128.0f;
@@ -149,40 +105,122 @@ private:
     }
 
     void sendPacket(const NDIlib_v6* api, NDIlib_send_instance_t sender,
-                    const BYTE* data, UINT32 frames, DWORD flags) {
-        const int channels = static_cast<int>(format_->nChannels);
+                    const WAVEFORMATEX* format, const BYTE* data, UINT32 frames, DWORD flags) {
+        const int channels = static_cast<int>(format->nChannels);
         if (channels <= 0 || frames == 0) return;
 
-        std::vector<float> planar(static_cast<size_t>(channels) * frames, 0.0f);
+        planar_.assign(static_cast<size_t>(channels) * frames, 0.0f);
         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) == 0 && data) {
             for (UINT32 frame = 0; frame < frames; ++frame) {
                 for (int ch = 0; ch < channels; ++ch) {
                     const size_t interleaved = static_cast<size_t>(frame) * channels + static_cast<size_t>(ch);
-                    planar[static_cast<size_t>(ch) * frames + frame] = readSample(data, interleaved);
+                    planar_[static_cast<size_t>(ch) * frames + frame] = readSample(format, data, interleaved);
                 }
             }
         }
 
-        NDIlib_audio_frame_v2_t audio{};
-        audio.sample_rate = static_cast<int>(format_->nSamplesPerSec);
+        NDIlib_audio_frame_v3_t audio{};
+        audio.sample_rate = static_cast<int>(format->nSamplesPerSec);
         audio.no_channels = channels;
         audio.no_samples = static_cast<int>(frames);
         audio.timecode = NDIlib_send_timecode_synthesize;
-        audio.p_data = planar.data();
+        audio.FourCC = NDIlib_FourCC_audio_type_FLTP;
+        audio.p_data = reinterpret_cast<std::uint8_t*>(planar_.data());
         audio.channel_stride_in_bytes = static_cast<int>(frames * sizeof(float));
-        api->send_send_audio_v2(sender, &audio);
+        api->send_send_audio_v3(sender, &audio);
     }
 
-    bool comInitialized_{false};
-    bool started_{false};
-    IMMDeviceEnumerator* enumerator_{};
-    IMMDevice* device_{};
-    IAudioClient* audioClient_{};
-    IAudioCaptureClient* captureClient_{};
-    WAVEFORMATEX* format_{};
+    void drain(const NDIlib_v6* api, NDIlib_send_instance_t sender,
+               IAudioCaptureClient* capture, const WAVEFORMATEX* format) {
+        UINT32 packetFrames = 0;
+        while (!stopRequested_.load() &&
+               SUCCEEDED(capture->GetNextPacketSize(&packetFrames)) && packetFrames > 0) {
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+
+            if (audioTransmissionAllowed() && frames > 0)
+                sendPacket(api, sender, format, data, frames, flags);
+
+            capture->ReleaseBuffer(frames);
+            packetFrames = 0;
+        }
+    }
+
+    void run(const NDIlib_v6* api, NDIlib_send_instance_t sender, const std::wstring& deviceId) {
+        const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool comInitialized = SUCCEEDED(init);
+        if (FAILED(init) && init != RPC_E_CHANGED_MODE) return;
+
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* device = nullptr;
+        IAudioClient* audioClient = nullptr;
+        IAudioCaptureClient* captureClient = nullptr;
+        WAVEFORMATEX* format = nullptr;
+        bool started = false;
+
+        auto cleanup = [&]() {
+            if (audioClient && started) audioClient->Stop();
+            if (captureClient) captureClient->Release();
+            if (audioClient) audioClient->Release();
+            if (device) device->Release();
+            if (enumerator) enumerator->Release();
+            if (format) CoTaskMemFree(format);
+            if (comInitialized) CoUninitialize();
+            running_ = false;
+        };
+
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                      __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+        if (FAILED(hr) || !enumerator) { cleanup(); return; }
+
+        if (!deviceId.empty()) hr = enumerator->GetDevice(deviceId.c_str(), &device);
+        else hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+
+        // Se o dispositivo salvo deixou de existir, volta para o padrão em vez de perder o áudio inteiro.
+        if ((FAILED(hr) || !device) && !deviceId.empty())
+            hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+        if (FAILED(hr) || !device) { cleanup(); return; }
+
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(&audioClient));
+        if (FAILED(hr) || !audioClient) { cleanup(); return; }
+
+        hr = audioClient->GetMixFormat(&format);
+        if (FAILED(hr) || !format) { cleanup(); return; }
+
+        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                     0, 0, format, nullptr);
+        if (FAILED(hr)) { cleanup(); return; }
+
+        hr = audioClient->GetService(__uuidof(IAudioCaptureClient),
+                                     reinterpret_cast<void**>(&captureClient));
+        if (FAILED(hr) || !captureClient) { cleanup(); return; }
+
+        hr = audioClient->Start();
+        if (FAILED(hr)) { cleanup(); return; }
+        started = true;
+        running_ = true;
+
+        // O loopback é drenado independentemente do FPS de vídeo. Cinco milissegundos
+        // mantém a fila curta sem fazer o áudio depender do relógio de 30/60 fps.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        while (!stopRequested_.load()) {
+            drain(api, sender, captureClient, format);
+            std::this_thread::sleep_for(5ms);
+        }
+        drain(api, sender, captureClient, format);
+        cleanup();
+    }
+
+    std::atomic_bool stopRequested_{false};
+    std::atomic_bool running_{false};
+    std::thread thread_;
+    std::vector<float> planar_;
 };
 
-WasapiLoopback gAudioCapture;
+AudioWorker gAudioWorker;
 
 std::filesystem::path executableDirectory() {
     std::vector<wchar_t> buffer(32768);
@@ -239,6 +277,7 @@ void logRemoteEndpoints(int ndiConnections) {
     snapshot << "Configured trusted IP: " << (gTrustedIp.empty() ? "(none - quick mode)" : gTrustedIp) << "\n";
     snapshot << "Selective IP filter: " << (receiverIpFilterActive() ? "ACTIVE" : "inactive") << "\n";
     snapshot << "System audio: " << (audioTransmissionAllowed() ? "sending" : "muted") << "\n";
+    snapshot << "Audio worker: " << (gAudioWorker.running() ? "running" : "inactive") << "\n";
 
     int ownedRows = 0;
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
@@ -262,8 +301,7 @@ void logRemoteEndpoints(int ndiConnections) {
     GetLocalTime(&st);
     std::ofstream out(executableDirectory() / L"ndi-ip-debug.txt", std::ios::app | std::ios::binary);
     if (!out) return;
-    out << "\r\n=== "
-        << st.wYear << '-';
+    out << "\r\n=== " << st.wYear << '-';
     if (st.wMonth < 10) out << '0';
     out << st.wMonth << '-';
     if (st.wDay < 10) out << '0';
@@ -294,6 +332,7 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
         error = L"Não foi possível inicializar o runtime NDI.";
         return false;
     }
+
     NDIlib_send_create_t create{};
     create.p_ndi_name = sourceName.c_str();
     create.clock_video = true;
@@ -317,14 +356,15 @@ bool NdiSender::open(const std::filesystem::path& runtimeDll, const std::string&
         }
     }
 
-    // O áudio é capturado por loopback WASAPI da saída padrão do Windows.
-    // Falha de áudio não impede a transmissão de vídeo.
-    gAudioCapture.open();
+    // Áudio tem fluxo próprio e não depende mais da frequência do vídeo.
+    // Falha de áudio não impede a transmissão de imagem.
+    gAudioWorker.start(api, sender, configuredAudioDeviceId());
     return true;
 }
 
 void NdiSender::close() {
-    gAudioCapture.close();
+    // O worker precisa terminar antes de destruir o sender NDI que ele utiliza.
+    gAudioWorker.stop();
     removeReceiverIpFilter();
     gTrustedIp.clear();
     auto* api = static_cast<const NDIlib_v6*>(api_);
@@ -353,10 +393,6 @@ bool NdiSender::sendFrame(const std::uint8_t* data, int width, int height, int f
     frame.p_data = const_cast<std::uint8_t*>(data);
     frame.line_stride_in_bytes = width * 4;
     api->send_send_video_v2(sender, &frame);
-
-    // Mantém o loopback drenado o tempo todo, mas só envia áudio quando a imagem
-    // também está autorizada. No modo protegido e durante privacidade o áudio fica mudo.
-    gAudioCapture.drain(api, sender, audioTransmissionAllowed());
     return true;
 }
 
@@ -365,7 +401,6 @@ int NdiSender::connections() const {
     if (!api || !sender_) return 0;
     const int technicalCount = api->send_get_no_connections(static_cast<NDIlib_send_instance_t>(sender_), 0);
     logRemoteEndpoints(technicalCount);
-    // O modo por IP trata todas as conexões técnicas da máquina permitida como um único receptor lógico.
     return technicalCount > 0 ? 1 : 0;
 }
 
