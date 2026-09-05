@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 class NdiSender {
 public:
@@ -20,4 +21,7 @@ private:
     void* module_{};
     const void* api_{};
     void* sender_{};
+    std::vector<std::uint8_t> asyncVideoBuffers_[2];
+    int asyncVideoIndex_{0};
+    bool asyncVideoSubmitted_{false};
 };
