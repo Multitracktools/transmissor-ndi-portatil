@@ -16,8 +16,7 @@ add_executable(zosma-transmitter WIN32
   src/tray_controller.cpp
   src/network_status_ui.cpp
   src/audio_persistence_ui.cpp
-  src/brand_ui.cpp
-  src/card_spacing_fix_ui.cpp
+  src/brand_ui_stable.cpp
   src/settings.cpp
   src/resources.rc
 )
