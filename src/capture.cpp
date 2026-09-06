@@ -106,6 +106,13 @@ private:
     int height_{};
 };
 
+void fillUnavailableFrame(std::vector<unsigned char>& bgra, int width, int height) {
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    if (bgra.size() != bytes) bgra.resize(bytes);
+    std::fill(bgra.begin(), bgra.end(), 0);
+    for (size_t i = 3; i < bgra.size(); i += 4) bgra[i] = 255;
+}
+
 // A captura principal acontece sempre na mesma thread de transmissão. Manter a superfície
 // por thread evita criar/destruir DC e DIB a cada quadro (30/60 vezes por segundo).
 thread_local GdiCaptureSurface gCaptureSurface;
@@ -127,12 +134,21 @@ std::vector<WindowSource> enumerateWindows(HWND appWindow) {
 bool captureToBuffer(const CaptureSource& source, bool showCursor, std::vector<unsigned char>& bgra, int& width, int& height) {
     RECT bounds = source.bounds;
     if (source.kind == CaptureKind::Window) {
+        // Janela fechada ou minimizada continua sendo tratada como fonte inválida.
         if (!IsWindow(source.window) || IsIconic(source.window) || !GetWindowRect(source.window, &bounds)) return false;
     }
 
     width = bounds.right - bounds.left;
     height = bounds.bottom - bounds.top;
-    if (width <= 0 || height <= 0 || !gCaptureSurface.ensure(width, height)) return false;
+    if (width <= 0 || height <= 0) return false;
+
+    // Em trocas temporárias para o Secure Desktop (Ctrl+Alt+Del/UAC), GetDC/BitBlt
+    // podem ficar indisponíveis por alguns instantes. Nessa situação mantemos o frame
+    // com a mesma resolução e enviamos preto, em vez de derrubar a fonte NDI.
+    if (!gCaptureSurface.ensure(width, height)) {
+        fillUnavailableFrame(bgra, width, height);
+        return true;
+    }
 
     HDC screen = gCaptureSurface.screen();
     HDC mem = gCaptureSurface.memory();
@@ -147,7 +163,10 @@ bool captureToBuffer(const CaptureSource& source, bool showCursor, std::vector<u
         if (ok && showCursor) drawCursor(mem, bounds);
     }
 
-    if (!ok) return false;
+    if (!ok) {
+        fillUnavailableFrame(bgra, width, height);
+        return true;
+    }
 
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
     if (bgra.size() != bytes) bgra.resize(bytes);
